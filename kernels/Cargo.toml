@@ -1,0 +1,11 @@
+[package]
+name = "nanoplaid-kernels"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The SIMD ladder: int8-query x 1-bit-doc MaxSim, from scalar to fused NEON SDOT"
+
+[dependencies]
+
+[profile.release]
+debug = true

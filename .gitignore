@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+kernels/target/
+Cargo.lock
+.venv/
