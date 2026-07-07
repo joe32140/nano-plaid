@@ -71,36 +71,41 @@ fn main() {
     );
     #[cfg(target_arch = "aarch64")]
     println!(
-        "aarch64, dotprod detected: {}\n",
-        std::arch::is_aarch64_feature_detected!("dotprod")
+        "aarch64: dotprod={} i8mm={}\n",
+        std::arch::is_aarch64_feature_detected!("dotprod"),
+        std::arch::is_aarch64_feature_detected!("i8mm")
     );
 
     let t1 = best_of(|| docs_f32.iter().map(|d| maxsim_f32(&q_deq, d, DIM)).sum());
     let t2 = best_of(|| docs.iter().map(|b| maxsim_scalar(&q, b, DIM)).sum());
     let t3 = best_of(|| docs.iter().map(|b| maxsim_autovec(&q, b, DIM)).sum());
-    let t4 = best_of(|| docs.iter().map(|b| maxsim(&q, b, DIM)).sum());
+    // Fused rungs only exist on a CPU with the feature; probe once, then time.
+    let t4 = maxsim_sdot(&q, &docs[0], DIM)
+        .map(|_| best_of(|| docs.iter().map(|b| maxsim_sdot(&q, b, DIM).unwrap()).sum()));
+    let t5 = maxsim_smmla(&q, &docs[0], DIM)
+        .map(|_| best_of(|| docs.iter().map(|b| maxsim_smmla(&q, b, DIM).unwrap()).sum()));
 
     let us = |d: Duration| d.as_secs_f64() * 1e6 / N_DOCS as f64;
     let rel = |d: Duration| t1.as_secs_f64() / d.as_secs_f64();
+    let line = |name: &str, t: Duration| {
+        println!("  {name}  {:>8.3} us/doc   {:>5.2}x", us(t), rel(t));
+    };
     println!("per-doc latency (lower is better; speedup vs rung 1):");
-    println!(
-        "  rung 1  f32 reference   {:>8.3} us/doc   {:>5.2}x",
-        us(t1),
-        rel(t1)
-    );
-    println!(
-        "  rung 2  2P-T scalar     {:>8.3} us/doc   {:>5.2}x",
-        us(t2),
-        rel(t2)
-    );
-    println!(
-        "  rung 3  autovectorized  {:>8.3} us/doc   {:>5.2}x",
-        us(t3),
-        rel(t3)
-    );
-    println!(
-        "  rung 4  dispatched      {:>8.3} us/doc   {:>5.2}x",
-        us(t4),
-        rel(t4)
-    );
+    line("rung 1  f32 reference  ", t1);
+    line("rung 2  2P-T scalar    ", t2);
+    line("rung 3  autovectorized ", t3);
+    match t4 {
+        Some(t) => line("rung 4  fused SDOT     ", t),
+        None => println!("  rung 4  fused SDOT      (no dotprod on this CPU)"),
+    }
+    match t5 {
+        Some(t) => line("rung 5  fused SMMLA    ", t),
+        None => println!("  rung 5  fused SMMLA     (no i8mm on this CPU)"),
+    }
+    if let (Some(a), Some(b)) = (t4, t5) {
+        println!(
+            "\n  SMMLA vs SDOT: {:.2}x",
+            a.as_secs_f64() / b.as_secs_f64()
+        );
+    }
 }

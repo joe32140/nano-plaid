@@ -2,17 +2,20 @@
 //!
 //! nanoplaid.py stores binary documents as packed sign bits and scores them
 //! with an int8 query through numpy/BLAS. This crate reimplements that one
-//! inner loop as a ladder of kernels, each rung one idea faster than the
-//! last, all returning bit-identical scores:
+//! inner loop as a ladder of kernels, each rung one more idea, all returning
+//! bit-identical scores:
 //!
 //!   rung 1  `maxsim_f32`      the float reference — what we are approximating
 //!   rung 2  `maxsim_scalar`   the 2P − T identity, one branch per bit
 //!   rung 3  `maxsim_autovec`  branchless masks, written so LLVM autovectorizes
 //!   rung 4  `maxsim_neon128`  fused doc-token-outer NEON SDOT (aarch64, dim 128)
+//!   rung 5  `maxsim_smmla128` fused SMMLA — half the instructions, but only
+//!                             ties rung 4 on the M4 (see its comment)
 //!
-//! `maxsim` dispatches to the best available rung at runtime. Rungs left as
-//! exercises (see README.md): portable `std::simd`, AVX2 masked-SAD and
-//! AVX-512 VNNI — production versions of all three live in next-plaid.
+//! `maxsim` dispatches to the best available rung at runtime (rung 4 on Apple
+//! Silicon — rung 5 ties, so it isn't preferred). Rungs left as exercises (see
+//! README.md): portable `std::simd`, AVX2 masked-SAD and AVX-512 VNNI —
+//! production versions of all three live in next-plaid.
 //!
 //! Layouts, chosen for kernels rather than ergonomics: a query is `nq` rows of
 //! `dim` values flattened into one slice; a binary document is `nd` rows of
@@ -33,6 +36,12 @@ pub struct QueryI8 {
     /// `planes[qi*128 + p*16 + k] = values[qi*128 + k*8 + p]` — the order in
     /// which `extract_planes_128` emits the document's bits.
     pub planes: Vec<i8>,
+    /// Query tokens re-packed in pairs for the SMMLA kernel (`dim == 128`
+    /// only): for pair `pidx` (tokens `2·pidx`, `2·pidx+1`), 16 chunks of
+    /// `[qa's 8 plane bytes | qb's 8 plane bytes]` — the 16-byte operand SMMLA
+    /// reads as two 8-wide rows. Same plane order as `planes`, so it dots
+    /// against the same `extract_planes_128` doc bytes.
+    pub planes_smmla: Vec<i8>,
 }
 
 pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
@@ -72,12 +81,33 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
     } else {
         Vec::new()
     };
+    // Pair-interleave the plane bytes so SMMLA can read a 16-byte operand as
+    // two 8-wide rows (qa then qb). Odd tail: the last pair repeats the final
+    // token, which cannot change a max.
+    let planes_smmla = if dim == 128 {
+        let n_pairs = nq.div_ceil(2);
+        let mut ps = vec![0i8; n_pairs * 256];
+        for pidx in 0..n_pairs {
+            let qa = 2 * pidx;
+            let qb = (2 * pidx + 1).min(nq - 1);
+            for i in 0..16 {
+                for j in 0..8 {
+                    ps[pidx * 256 + i * 16 + j] = planes[qa * 128 + i * 8 + j];
+                    ps[pidx * 256 + i * 16 + 8 + j] = planes[qb * 128 + i * 8 + j];
+                }
+            }
+        }
+        ps
+    } else {
+        Vec::new()
+    };
     QueryI8 {
         dim,
         values,
         scales,
         sums,
         planes,
+        planes_smmla,
     }
 }
 
@@ -309,6 +339,144 @@ mod neon {
         }
         total
     }
+
+    // -----------------------------------------------------------------------
+    // Rung 5 (aarch64 + i8mm, dim = 128): SMMLA. One idea on top of rung 4.
+    //
+    // SDOT does 16 MACs per instruction (four 4-wide dot products). SMMLA does
+    // 32: it reads each 16-byte operand as a 2×8 int8 matrix and computes the
+    // full 2×2 product of dot products — so one instruction scores TWO query
+    // tokens against TWO doc tokens over 8 dims at once:
+    //
+    //     acc[0]+=qa·da  acc[1]+=qa·db   (Vn = [qa 8B | qb 8B],
+    //     acc[2]+=qb·da  acc[3]+=qb·db    Vm = [da 8B | db 8B])
+    //
+    // Covering dim 128 takes 16 SMMLA (16×8 dims) per 2×2 tile vs rung 4's
+    // 8 SDOT per (query, doc) pair — half the instructions for the same tile,
+    // so the ceiling is ~2× IF the core issues SMMLA as fast as SDOT.
+    //
+    // It does not, on the Apple M4: measured, rung 5 only *ties* rung 4
+    // (~1.90 vs ~1.88 µs/doc). Half the instructions at ~half the issue rate
+    // nets zero — the classic reason you benchmark the instruction on the
+    // actual microarchitecture instead of counting MACs on paper. SMMLA can
+    // still win on cores that issue it at SDOT's rate (some Neoverse parts),
+    // which is why it stays exposed rather than deleted.
+    //
+    // The query is pre-interleaved into pairs (QueryI8::planes_smmla); each doc
+    // pair is expanded to plane-major and zipped into `[da chunk | db chunk]`
+    // 16-byte operands once, then reused across every query pair.
+
+    /// `smmla vD.4s, vN.16b, vM.16b` via inline asm (`vmmlaq_s32` is nightly).
+    ///
+    /// # Safety
+    /// Requires the `i8mm` target feature at runtime — the dispatcher checks;
+    /// without it this is a SIGILL, not a wrong answer.
+    #[inline(always)]
+    unsafe fn smmla(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let out: int32x4_t;
+        // Unlike sdot (in the target's baseline), smmla needs i8mm enabled for
+        // the assembler; the directive scopes it to this fragment.
+        std::arch::asm!(
+            ".arch_extension i8mm",
+            "smmla {out:v}.4s, {a:v}.16b, {b:v}.16b",
+            out = inout(vreg) acc => out,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+        out
+    }
+
+    /// # Safety
+    /// Requires `i8mm`; `q.planes_smmla` must be populated (dim == 128) and
+    /// `bits.len() == n_d * 16`.
+    pub unsafe fn maxsim_smmla128(q: &super::QueryI8, bits: &[u8]) -> f32 {
+        let n_q = q.sums.len();
+        let n_d = bits.len() / 16;
+        let n_pairs = n_q.div_ceil(2);
+        let mut best = vec![i32::MIN; n_q];
+        let mut plane_a = [0i8; 128];
+        let mut plane_b = [0i8; 128];
+        let mut docbuf = [0i8; 256];
+        let qbuf = q.planes_smmla.as_ptr();
+
+        let mut dj = 0usize;
+        while dj < n_d {
+            let da = dj;
+            let db = (dj + 1).min(n_d - 1);
+            extract_planes_128(&bits[da * 16..da * 16 + 16], &mut plane_a);
+            extract_planes_128(&bits[db * 16..db * 16 + 16], &mut plane_b);
+            // Zip the two plane buffers into `[da chunk i | db chunk i]` 16-byte
+            // operands: interleave in 64-bit groups (low/high halves).
+            for j in 0..8 {
+                let va = vld1q_s8(plane_a.as_ptr().add(j * 16));
+                let vb = vld1q_s8(plane_b.as_ptr().add(j * 16));
+                vst1q_s8(
+                    docbuf.as_mut_ptr().add(2 * j * 16),
+                    vcombine_s8(vget_low_s8(va), vget_low_s8(vb)),
+                );
+                vst1q_s8(
+                    docbuf.as_mut_ptr().add((2 * j + 1) * 16),
+                    vcombine_s8(vget_high_s8(va), vget_high_s8(vb)),
+                );
+            }
+            let dp = docbuf.as_ptr();
+            for pidx in 0..n_pairs {
+                let qa = 2 * pidx;
+                let qb = (2 * pidx + 1).min(n_q - 1);
+                let qp = qbuf.add(pidx * 256);
+                // 16 SMMLA over four accumulator chains to hide SMMLA latency.
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                let mut c = vdupq_n_s32(0);
+                let mut d = vdupq_n_s32(0);
+                let mut i = 0;
+                while i < 16 {
+                    a = smmla(a, vld1q_s8(qp.add(i * 16)), vld1q_s8(dp.add(i * 16)));
+                    b = smmla(
+                        b,
+                        vld1q_s8(qp.add((i + 1) * 16)),
+                        vld1q_s8(dp.add((i + 1) * 16)),
+                    );
+                    c = smmla(
+                        c,
+                        vld1q_s8(qp.add((i + 2) * 16)),
+                        vld1q_s8(dp.add((i + 2) * 16)),
+                    );
+                    d = smmla(
+                        d,
+                        vld1q_s8(qp.add((i + 3) * 16)),
+                        vld1q_s8(dp.add((i + 3) * 16)),
+                    );
+                    i += 4;
+                }
+                // p = [P(qa,da), P(qa,db), P(qb,da), P(qb,db)].
+                let p = vaddq_s32(vaddq_s32(a, b), vaddq_s32(c, d));
+                let tvec = {
+                    let t = [q.sums[qa], q.sums[qa], q.sums[qb], q.sums[qb]];
+                    vld1q_s32(t.as_ptr())
+                };
+                let sc = vsubq_s32(vshlq_n_s32::<1>(p), tvec);
+                // pairwise max -> lane0 = best of qa over {da,db}, lane1 = qb.
+                let pm = vpmaxq_s32(sc, sc);
+                let m_qa = vgetq_lane_s32::<0>(pm);
+                let m_qb = vgetq_lane_s32::<1>(pm);
+                best[qa] = best[qa].max(m_qa);
+                // Odd query tail: qb == qa, so fold its score into qa too.
+                if qb != qa {
+                    best[qb] = best[qb].max(m_qb);
+                } else {
+                    best[qa] = best[qa].max(m_qb);
+                }
+            }
+            dj += 2;
+        }
+        let mut total = 0.0f32;
+        for (qi, &scale) in q.scales.iter().enumerate() {
+            total += best[qi] as f32 * scale;
+        }
+        total
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,11 +486,35 @@ mod neon {
 // with `-C target-cpu=native`.
 
 pub fn maxsim(q: &QueryI8, bits: &[u8], dim: usize) -> f32 {
+    // SDOT first: rung 5 (SMMLA) only ties it on the M4 (see its comment), so
+    // there's no reason to prefer the more complex kernel. SMMLA stays exposed
+    // for the bench and for cores that may issue it faster.
     #[cfg(target_arch = "aarch64")]
-    if dim == 128 && !q.planes.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
-        return unsafe { neon::maxsim_neon128(q, bits) };
+    if let Some(v) = maxsim_sdot(q, bits, dim) {
+        return v;
     }
     maxsim_autovec(q, bits, dim)
+}
+
+/// Rung 4 (fused NEON SDOT) if this CPU has `dotprod` and `dim == 128`, else
+/// `None`. Exposed so the bench can time it head-to-head with SMMLA.
+#[allow(unused_variables)]
+pub fn maxsim_sdot(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if dim == 128 && !q.planes.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_neon128(q, bits) });
+    }
+    None
+}
+
+/// Rung 5 (fused SMMLA) if this CPU has `i8mm` and `dim == 128`, else `None`.
+#[allow(unused_variables)]
+pub fn maxsim_smmla(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if dim == 128 && !q.planes_smmla.is_empty() && std::arch::is_aarch64_feature_detected!("i8mm") {
+        return Some(unsafe { neon::maxsim_smmla128(q, bits) });
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -356,14 +548,24 @@ mod tests {
     #[test]
     fn all_rungs_agree_exactly() {
         // Integer-domain kernels must agree bit-for-bit, across shapes that
-        // exercise the NEON block tail (nd % 4 != 0).
+        // exercise the SDOT block tail (nd % 4 != 0) and the SMMLA pair tails
+        // (odd nq and odd nd).
         for &(nq, nd, dim) in &[(32, 80, 128), (7, 3, 128), (1, 1, 128), (5, 9, 64)] {
             let (q, bits) = setup(nq, nd, dim, 42 + nd as u64);
             let a = maxsim_scalar(&q, &bits, dim);
-            let b = maxsim_autovec(&q, &bits, dim);
-            let c = maxsim(&q, &bits, dim);
-            assert_eq!(a, b, "scalar vs autovec ({nq},{nd},{dim})");
-            assert_eq!(a, c, "scalar vs dispatched ({nq},{nd},{dim})");
+            assert_eq!(
+                a,
+                maxsim_autovec(&q, &bits, dim),
+                "autovec ({nq},{nd},{dim})"
+            );
+            assert_eq!(a, maxsim(&q, &bits, dim), "dispatched ({nq},{nd},{dim})");
+            // Fused kernels, when this CPU/dim supports them, must also match.
+            if let Some(v) = maxsim_sdot(&q, &bits, dim) {
+                assert_eq!(a, v, "sdot ({nq},{nd},{dim})");
+            }
+            if let Some(v) = maxsim_smmla(&q, &bits, dim) {
+                assert_eq!(a, v, "smmla ({nq},{nd},{dim})");
+            }
         }
     }
 

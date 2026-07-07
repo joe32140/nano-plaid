@@ -9,10 +9,11 @@ faster, all returning **bit-identical** scores:
 
 | rung | idea | µs/doc (M4) | vs rung 1 |
 |------|------|------------:|----------:|
-| 1 `maxsim_f32` | scalar float reference | 73.97 | 1.0× |
-| 2 `maxsim_scalar` | the `2P − T` identity, one branch per bit | 181.41 | 0.41× |
-| 3 `maxsim_autovec` | branchless masks → LLVM autovectorizes | 84.25 | 0.88× |
-| 4 `maxsim_neon128` | fused doc-token-outer NEON SDOT | 1.92 | 38.6× |
+| 1 `maxsim_f32` | scalar float reference | 72.6 | 1.0× |
+| 2 `maxsim_scalar` | the `2P − T` identity, one branch per bit | 174.5 | 0.42× |
+| 3 `maxsim_autovec` | branchless masks → LLVM autovectorizes | 82.3 | 0.88× |
+| 4 `maxsim_neon128` | fused doc-token-outer NEON SDOT | 1.89 | 38.5× |
+| 5 `maxsim_smmla128` | fused SMMLA — half the instructions | 1.90 | 38.2× |
 
 (32-token query × 2000 docs × 80 tokens, dim=128, Apple M4,
 `cargo run --release --example bench`.)
@@ -24,6 +25,15 @@ problem *expressible* as integer ops a vector unit is good at; rungs 3–4 are
 where that gets cashed in, and almost all of it comes from rung 4's two ideas:
 a hardware dot-product instruction, and inverting the loop so each doc token
 is bit-expanded once in registers and amortized over all query tokens.
+
+**Rung 5 is the counterexample that proves you have to measure.** SMMLA is a
+matrix instruction: it does 32 int8 MACs where SDOT does 16, so on paper it
+should halve the instruction count and run ~2× faster. It doesn't — on the M4
+it *ties* rung 4, because Apple's cores issue SMMLA at about half SDOT's rate.
+Half the instructions at half the throughput nets zero. Counting MACs on paper
+predicted a 2× win; the only way to know it evaporates is to run it on the
+actual microarchitecture. (It may still win on cores that issue SMMLA at
+SDOT's rate — some ARM Neoverse parts — which is why it's kept, not deleted.)
 
 ## the math
 

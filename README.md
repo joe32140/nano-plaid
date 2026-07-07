@@ -81,11 +81,13 @@ Two honest observations, both of which are the point of the repo:
 ## the kernel ladder (`kernels/`)
 
 The one inner loop that matters — int8 query × packed 1-bit docs MaxSim —
-rebuilt in Rust as four rungs, from scalar reference to a fused NEON SDOT
+rebuilt in Rust as five rungs, from scalar reference to a fused NEON SDOT
 kernel, all bit-identical, benchmarked on the way up (spoiler: the algebraic
 identity alone makes things *slower*; the memory layout and loop order are
-the speedup — 38× by the top rung). Plus field notes on the three ways
-microbenchmarks lied to us while building the production version. See
+the speedup — 38× by rung 4). Rung 5 swaps SDOT for the denser SMMLA matrix
+instruction, which *should* be 2× and instead ties — a measured lesson in why
+you don't trust a MAC count without running it. Plus field notes on the three
+ways microbenchmarks lied to us while building the production version. See
 [kernels/README.md](kernels/README.md).
 
 A thin [pyo3 bridge](kernels/src/python.rs) exposes the top rung to numpy, so
