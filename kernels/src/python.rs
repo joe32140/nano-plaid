@@ -23,7 +23,9 @@ use crate::{maxsim, quantize_query_i8};
 /// `nanoplaid.score_binary` followed by the per-doc max-reduce and sum, but
 /// computed through the dispatched Rust kernel (NEON SDOT where available).
 /// The query is int8-quantized here exactly as `nanoplaid.quantize_query_i8`
-/// does, so scores match the numpy path up to f32 rounding.
+/// does (same scale, same round-to-even), so the integer scores are identical;
+/// the returned f32 can differ only in the last few ulps, from the order the
+/// per-query-token maxes are summed.
 #[pyfunction]
 fn maxsim_docs<'py>(
     py: Python<'py>,
@@ -37,6 +39,11 @@ fn maxsim_docs<'py>(
         return Err(PyValueError::new_err(
             "dim must be a positive multiple of 8",
         ));
+    }
+    if query.shape()[0] == 0 {
+        // Guard here, not in quantize_query_i8: its debug assert would abort
+        // inside the kernel rather than raising a clean Python error.
+        return Err(PyValueError::new_err("query must have at least one token"));
     }
     if payload.shape()[1] != pd {
         return Err(PyValueError::new_err(
@@ -61,19 +68,18 @@ fn maxsim_docs<'py>(
         return Err(PyValueError::new_err("payload rows must equal sum(lens)"));
     }
 
-    // Compute off the GIL: the borrowed slices outlive the closure, and the
-    // rescore over all candidates is exactly the work worth parallelizing.
-    let out = py.allow_threads(|| {
-        let q8 = quantize_query_i8(q, dim);
-        let mut out = Vec::with_capacity(lens.len());
-        let mut off = 0usize;
-        for &n in lens {
-            let n = n as usize;
-            out.push(maxsim(&q8, &payload[off * pd..(off + n) * pd], dim));
-            off += n;
-        }
-        out
-    });
+    // Score under the GIL. The work is microseconds and eval.py is
+    // single-threaded, so releasing it with py.allow_threads would buy nothing
+    // here while adding a real soundness caveat: PyReadonlyArray does not lock
+    // the numpy buffer, so another Python thread could mutate it mid-read.
+    let q8 = quantize_query_i8(q, dim);
+    let mut out = Vec::with_capacity(lens.len());
+    let mut off = 0usize;
+    for &n in lens {
+        let n = n as usize;
+        out.push(maxsim(&q8, &payload[off * pd..(off + n) * pd], dim));
+        off += n;
+    }
     Ok(PyArray1::from_vec_bound(py, out))
 }
 

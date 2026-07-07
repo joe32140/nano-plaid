@@ -90,8 +90,9 @@ microbenchmarks lied to us while building the production version. See
 
 A thin [pyo3 bridge](kernels/src/python.rs) exposes the top rung to numpy, so
 `eval.py --backend rust` scores the binary stage-2 with the SDOT kernel —
-same NDCG@10, and on SciFact the rescore's p50 drops from ~68ms to ~45ms
-(the rest of the two-stage pipeline is still numpy; Amdahl caps the win).
+identical NDCG@10 (0.7513). Measured back-to-back on SciFact, swapping only
+that stage cuts end-to-end p50 from ~57ms to ~44ms; the rest of the two-stage
+pipeline stays numpy, so Amdahl's law caps the win at rescoring's share of it.
 
 ## relationship to next-plaid
 

@@ -48,7 +48,11 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
         let scale = max_abs / 127.0;
         scales[i] = scale;
         for (d, &x) in row.iter().enumerate() {
-            values[i * dim + d] = (x / scale).round().clamp(-127.0, 127.0) as i8;
+            // round_ties_even matches numpy's np.rint (banker's rounding); plain
+            // f32::round rounds halves away from zero and would assign a
+            // different code on exact .5 values, breaking parity with the
+            // numpy backend.
+            values[i * dim + d] = (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
         }
     }
     let sums = values

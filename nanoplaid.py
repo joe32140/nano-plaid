@@ -340,14 +340,16 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
         cand = cand[np.sort(np.argpartition(-approx, n_full - 1)[:n_full])]
         rows, bounds = _gather_rows(index, cand)
 
-    # Stage 2: exact rescore of the survivors.
-    if index.scheme == "residual":
-        sim = q @ decode_rows(index, rows).T
-        scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
-    elif binary_scorer is not None:
+    # Stage 2: exact rescore of the survivors. The Rust kernel returns per-doc
+    # scores directly; both numpy paths produce a [nq, n_tok] similarity that
+    # shares the same max-reduce-and-sum tail.
+    if index.scheme == "binary" and binary_scorer is not None:
         scores = binary_scorer(q, index.payload[rows], index.doc_lens[cand])
     else:
-        sim = score_binary(quantize_query_i8(q), index.payload[rows], index.dim)
+        if index.scheme == "residual":
+            sim = q @ decode_rows(index, rows).T
+        else:
+            sim = score_binary(quantize_query_i8(q), index.payload[rows], index.dim)
         scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
 
     top, top_scores = _topk(scores, k)
