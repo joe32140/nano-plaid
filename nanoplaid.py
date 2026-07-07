@@ -316,7 +316,12 @@ def _gather_rows(index, cand):
     return rows, bounds
 
 
-def search(index, q, k=10, n_probe=8, n_full=1024):
+def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
+    """Two-stage search. `binary_scorer`, if given, replaces the numpy binary
+    stage-2: it takes (query [nq, dim], candidates' packed rows, per-doc token
+    counts) and returns one score per candidate doc -- the hook eval.py uses to
+    drop in the Rust kernel. Ignored for the residual scheme.
+    """
     q = np.ascontiguousarray(q, dtype=np.float32)
     cs = q @ index.centroids.T                                   # [nq, K]
 
@@ -338,9 +343,12 @@ def search(index, q, k=10, n_probe=8, n_full=1024):
     # Stage 2: exact rescore of the survivors.
     if index.scheme == "residual":
         sim = q @ decode_rows(index, rows).T
+        scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
+    elif binary_scorer is not None:
+        scores = binary_scorer(q, index.payload[rows], index.doc_lens[cand])
     else:
         sim = score_binary(quantize_query_i8(q), index.payload[rows], index.dim)
-    scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
+        scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
 
     top, top_scores = _topk(scores, k)
     return cand[top], top_scores

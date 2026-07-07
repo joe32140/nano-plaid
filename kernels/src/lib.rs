@@ -322,6 +322,13 @@ pub fn maxsim(q: &QueryI8, bits: &[u8], dim: usize) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Python bridge — the numpy extension `eval.py --backend rust` imports. Opt-in
+// (feature = "python") so `cargo test` / the bench example stay dependency-free.
+
+#[cfg(feature = "python")]
+mod python;
+
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

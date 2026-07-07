@@ -43,6 +43,10 @@ python nanoplaid.py                    # self-test on synthetic data
 pip install pylate                     # encoder only (torch; GPU/MPS helps)
 python encode.py --download scifact --out data/scifact
 python eval.py data/scifact
+
+# optional: score the binary stage-2 with the Rust kernel instead of numpy
+maturin develop -m kernels/Cargo.toml --release --features python
+python eval.py data/scifact --backend rust
 ```
 
 ## results (SciFact, `lightonai/LateOn-regularized`, Apple M4)
@@ -84,6 +88,11 @@ the speedup — 38× by the top rung). Plus field notes on the three ways
 microbenchmarks lied to us while building the production version. See
 [kernels/README.md](kernels/README.md).
 
+A thin [pyo3 bridge](kernels/src/python.rs) exposes the top rung to numpy, so
+`eval.py --backend rust` scores the binary stage-2 with the SDOT kernel —
+same NDCG@10, and on SciFact the rescore's p50 drops from ~68ms to ~45ms
+(the rest of the two-stage pipeline is still numpy; Amdahl caps the win).
+
 ## relationship to next-plaid
 
 [next-plaid](https://github.com/lightonai/next-plaid) is the production
@@ -100,8 +109,9 @@ scheme here mirrors the one contributed to next-plaid in
 ```
 nanoplaid.py   the entire index + search engine (numpy only)
 encode.py      BEIR dataset + ColBERT model -> token-embedding bundle (pylate)
-eval.py        NDCG@10 / latency / storage for every scheme
-kernels/       the Rust SIMD ladder
+eval.py        NDCG@10 / latency / storage for every scheme (--backend numpy|rust)
+kernels/       the Rust SIMD ladder + optional pyo3 bridge
+pyproject.toml maturin config for the optional Rust extension
 ```
 
 MIT license.

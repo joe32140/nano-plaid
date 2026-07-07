@@ -53,6 +53,22 @@ All three of these happened while writing these kernels' production twin:
   `is_aarch64_feature_detected!` at runtime; this is why production kernels
   can't just build with `-C target-cpu=native` and ship the binary.
 
+## using it from python
+
+The top rung is exposed to numpy through a [pyo3 bridge](src/python.rs)
+(feature-gated, so `cargo test` and the bench stay dependency-free):
+
+```bash
+maturin develop -m kernels/Cargo.toml --release --features python
+python ../eval.py ../data/scifact --backend rust
+```
+
+`maxsim_docs(query, payload, lens)` scores a query's candidate documents and
+returns one MaxSim per doc — the exact numbers `nanoplaid.score_binary`
+produces, computed through this crate's dispatched kernel. On an Apple Silicon
+Mac, build with `--target aarch64-apple-darwin` so the extension is native and
+the SDOT rung actually runs (see the Rosetta note above).
+
 ## exercises
 
 Each has a production answer in

@@ -5,7 +5,17 @@ edition = "2021"
 license = "MIT"
 description = "The SIMD ladder: int8-query x 1-bit-doc MaxSim, from scalar to fused NEON SDOT"
 
+[lib]
+# rlib for the bench example + tests; cdylib for the maturin-built python module.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+# Opt-in so `cargo test` and `cargo run --example bench` need no python toolchain.
+python = ["dep:pyo3", "dep:numpy"]
 
 [profile.release]
 debug = true

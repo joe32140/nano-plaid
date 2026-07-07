@@ -70,12 +70,17 @@ def main():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--n-probe", type=int, default=8)
     ap.add_argument("--n-full", type=int, default=1024)
+    ap.add_argument("--backend", choices=["numpy", "rust"], default="numpy",
+                    help="binary stage-2 scorer; 'rust' needs the kernels extension "
+                         "(maturin develop -m kernels/Cargo.toml --release --features python)")
     args = ap.parse_args()
+
+    binary_scorer = make_rust_scorer() if args.backend == "rust" else None
 
     b = load_bundle(args.bundle)
     dim = b["corpus"].shape[1]
     print(f"{len(b['doc_lens'])} docs, {len(b['corpus'])} tokens, "
-          f"{len(b['query_lens'])} queries, dim={dim}\n")
+          f"{len(b['query_lens'])} queries, dim={dim}, backend={args.backend}\n")
 
     schemes = args.schemes.split(",")
     header = (f"| scheme     | build s | B/token | NDCG@{args.k} | mean ms | p50 ms | p95 ms |")
@@ -93,9 +98,25 @@ def main():
                         centroids=centroids, verbose=centroids is None)
         build_s = time.perf_counter() - t
         centroids = idx.centroids
-        n, lat = run(b, lambda q: npl.search(idx, q, args.k, args.n_probe, args.n_full)[0],
-                     args.k)
+        scorer = binary_scorer if name == "binary" else None
+        n, lat = run(b, lambda q: npl.search(idx, q, args.k, args.n_probe,
+                                             args.n_full, scorer)[0], args.k)
         row(scheme, build_s, idx.bytes_per_token(), n, lat, args.k)
+
+
+def make_rust_scorer():
+    """Wrap the Rust extension as a nanoplaid binary_scorer. Coerce dtype and
+    contiguity at the boundary: the pyo3 signature is strict (f32/u8/i64,
+    C-contiguous) and a mismatch would raise rather than convert."""
+    import nanoplaid_kernels
+
+    def scorer(q, payload, lens):
+        return nanoplaid_kernels.maxsim_docs(
+            np.ascontiguousarray(q, np.float32),
+            np.ascontiguousarray(payload, np.uint8),
+            np.ascontiguousarray(lens, np.int64))
+
+    return scorer
 
 
 def search_exhaustive_ids(b, q, k):
