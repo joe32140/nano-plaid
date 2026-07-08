@@ -26,6 +26,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
+      # Indicative only — GitHub runners are shared VMs, so treat the absolute
+      # µs/doc as noisy; it shows which fused kernel this arch dispatches to.
+      - name: bench (indicative)
+        run: cargo run --release --example bench
 
   # The numpy engine: self-test plus the committed toy bundle end-to-end.
   python:
