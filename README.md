@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/banner.svg" width="100%"
+       alt="nano-plaid — late-interaction retrieval (ColBERT + PLAID) in one numpy file. 1-bit documents: 25x smaller, 97.8% of exhaustive NDCG, 3.3x faster with SIMD kernels.">
+</p>
+
 # nano-plaid
 
 The simplest complete implementation of **late-interaction retrieval**
