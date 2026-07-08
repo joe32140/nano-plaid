@@ -30,6 +30,7 @@ Assumes embeddings are L2-normalized per token (ColBERT models do this), so
 dot product == cosine similarity.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -238,6 +239,15 @@ class Index:
     def bytes_per_token(self):
         return self.payload.shape[1] + 4   # payload + int32 centroid code
 
+    def nbytes(self):
+        """Resident memory of the index: compressed payload + codes + codebook
+        + inverted file. (Build transiently uses more; this is what you keep.)"""
+        arrays = [self.payload, self.codes, self.centroids, self.ivf_offsets,
+                  self.ivf_docs, self.doc_lens, self.doc_offsets]
+        if self.codec is not None:
+            arrays += [self.codec.cutoffs, self.codec.weights]
+        return sum(a.nbytes for a in arrays)
+
 
 def build(corpus, doc_lens, scheme="residual", nbits=4,
           n_centroids=None, centroids=None, seed=0, verbose=True):
@@ -316,12 +326,30 @@ def _gather_rows(index, cand):
     return rows, bounds
 
 
-def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
+class _StageClock:
+    """Profiling-only helper: if `timings` is a dict, each mark() adds the
+    seconds since the previous mark under its name. If None, it's a no-op, so
+    the normal search path pays nothing."""
+    def __init__(self, timings):
+        self.timings = timings
+        self.t = time.perf_counter() if timings is not None else None
+
+    def mark(self, name):
+        if self.timings is None:
+            return
+        now = time.perf_counter()
+        self.timings[name] = self.timings.get(name, 0.0) + (now - self.t)
+        self.t = now
+
+
+def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None, timings=None):
     """Two-stage search. `binary_scorer`, if given, replaces the numpy binary
     stage-2: it takes (query [nq, dim], candidates' packed rows, per-doc token
     counts) and returns one score per candidate doc -- the hook eval.py uses to
-    drop in the Rust kernel. Ignored for the residual scheme.
+    drop in the Rust kernel. Ignored for the residual scheme. `timings`, if a
+    dict, collects per-stage seconds (profiling only).
     """
+    clock = _StageClock(timings)
     q = np.ascontiguousarray(q, dtype=np.float32)
     cs = q @ index.centroids.T                                   # [nq, K]
 
@@ -332,6 +360,7 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
          for c in probes.ravel()] or [np.empty(0, np.int32)]))
     if len(cand) == 0:
         return np.empty(0, np.int64), np.empty(0, np.float32)
+    clock.mark("probe")
 
     # Stage 1.5: approximate scores from centroid ids alone.
     rows, bounds = _gather_rows(index, cand)
@@ -339,6 +368,7 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
     if len(cand) > n_full:
         cand = cand[np.sort(np.argpartition(-approx, n_full - 1)[:n_full])]
         rows, bounds = _gather_rows(index, cand)
+    clock.mark("rank")
 
     # Stage 2: exact rescore of the survivors. The Rust kernel returns per-doc
     # scores directly; both numpy paths produce a [nq, n_tok] similarity that
@@ -353,6 +383,7 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None):
         scores = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
 
     top, top_scores = _topk(scores, k)
+    clock.mark("rescore")
     return cand[top], top_scores
 
 

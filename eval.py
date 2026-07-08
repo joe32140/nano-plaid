@@ -73,15 +73,19 @@ def run(b, search_fn, k=10):
     return float(np.mean(ndcgs)), np.array(lat)
 
 
-def eval_bundle(b, schemes, args, scorer, verbose=False):
-    """Evaluate every scheme on one bundle. Returns {scheme: (ndcg, lat, bpt)}."""
+def eval_bundle(b, schemes, args, scorer, verbose=False, profile=False):
+    """Evaluate every scheme on one bundle. Returns {scheme: {ndcg, lat, bpt,
+    build_s, index_mb, stages}}. With profile=True, per-stage search times are
+    collected too."""
     dim = b["corpus"].shape[1]
     out = {}
     centroids = None  # trained once per bundle, shared across its two-stage schemes
     for scheme in schemes:
         if scheme == "exact":
             n, lat = run(b, lambda q: search_exhaustive_ids(b, q, args.k), args.k)
-            out[scheme] = (n, lat, 4 * dim, None)
+            # "index" for exact is just the float corpus you must keep resident.
+            out[scheme] = dict(ndcg=n, lat=lat, bpt=4 * dim, build_s=None,
+                               index_mb=b["corpus"].nbytes / 1e6, stages={})
             continue
         name, nbits = ("binary", 0) if scheme == "binary" else ("residual", int(scheme[-1]))
         t = time.perf_counter()
@@ -90,9 +94,12 @@ def eval_bundle(b, schemes, args, scorer, verbose=False):
         build_s = time.perf_counter() - t
         centroids = idx.centroids
         s = scorer if name == "binary" else None
+        stages = {} if profile else None
         n, lat = run(b, lambda q: npl.search(idx, q, args.k, args.n_probe,
-                                             args.n_full, s)[0], args.k)
-        out[scheme] = (n, lat, idx.bytes_per_token(), build_s)
+                                             args.n_full, s, stages)[0], args.k)
+        out[scheme] = dict(ndcg=n, lat=lat, bpt=idx.bytes_per_token(),
+                           build_s=build_s, index_mb=idx.nbytes() / 1e6,
+                           stages=stages or {})
     return out
 
 
@@ -101,27 +108,35 @@ def eval_single(path, schemes, args, scorer):
     dim = b["corpus"].shape[1]
     print(f"{len(b['doc_lens'])} docs, {len(b['corpus'])} tokens, "
           f"{len(b['query_lens'])} queries, dim={dim}, backend={args.backend}\n")
-    results = eval_bundle(b, schemes, args, scorer, verbose=True)
+    results = eval_bundle(b, schemes, args, scorer, verbose=True, profile=args.profile)
+    if args.profile:
+        print_profile(results, schemes, args.k)
+        return
     header = f"| scheme     | build s | B/token | NDCG@{args.k} | mean ms | p50 ms | p95 ms |"
     print(header + "\n|" + "|".join("-" * (len(c) - 1) for c in header.split("|")[1:-1]) + "|")
     for scheme in schemes:
-        ndcg, lat, bpt, build_s = results[scheme]
-        row(scheme, build_s, bpt, ndcg, lat, args.k)
+        r = results[scheme]
+        row(scheme, r["build_s"], r["bpt"], r["ndcg"], r["lat"], args.k)
 
 
 def eval_multi(root, schemes, args, scorer):
-    """A directory of bundles -> per-domain NDCG@k matrix + average row."""
+    """A directory of bundles -> per-domain NDCG@k matrix + average row (or, with
+    --profile, an aggregate speed+memory table summed/pooled across domains)."""
     names = sorted(d.name for d in Path(root).iterdir() if is_bundle(d))
-    ndcg = {}   # name -> {scheme: ndcg}
-    bpt = {}
+    per_domain = {}
     for name in names:
         b = load_bundle(Path(root) / name)
         print(f"evaluating {name} ({len(b['doc_lens'])} docs, {len(b['query_lens'])} queries)...",
               flush=True)
-        res = eval_bundle(b, schemes, args, scorer)
-        ndcg[name] = {s: res[s][0] for s in schemes}
-        bpt = {s: res[s][2] for s in schemes}
+        per_domain[name] = eval_bundle(b, schemes, args, scorer, profile=args.profile)
 
+    if args.profile:
+        print_profile(merge_domains(per_domain, schemes), schemes, args.k,
+                      note="index MB and build s summed across domains; latency pooled")
+        return
+
+    ndcg = {n: {s: per_domain[n][s]["ndcg"] for s in schemes} for n in names}
+    bpt = {s: per_domain[names[0]][s]["bpt"] for s in schemes}
     w = max(len(n) for n in names + ["average"])
     head = f"| {'dataset':<{w}} | " + " | ".join(f"{s:>8}" for s in schemes) + " |"
     print("\n" + head)
@@ -137,6 +152,50 @@ def eval_multi(root, schemes, args, scorer):
         print(f"binary keeps {100 * avg['binary'] / avg['exact']:.1f}% of exact NDCG on average")
 
 
+def merge_domains(per_domain, schemes):
+    """Pool per-domain profile results into one: sum memory/build, concat
+    latencies, sum stage times, mean NDCG."""
+    agg = {}
+    for s in schemes:
+        rs = [per_domain[n][s] for n in per_domain]
+        stages = {}
+        for r in rs:
+            for key, v in r["stages"].items():
+                stages[key] = stages.get(key, 0.0) + v
+        builds = [r["build_s"] for r in rs if r["build_s"] is not None]
+        agg[s] = dict(
+            ndcg=float(np.mean([r["ndcg"] for r in rs])),
+            lat=np.concatenate([r["lat"] for r in rs]),
+            bpt=rs[0]["bpt"],
+            build_s=sum(builds) if builds else None,
+            index_mb=sum(r["index_mb"] for r in rs),
+            stages=stages,
+        )
+    return agg
+
+
+def print_profile(results, schemes, k, note=None):
+    """Speed + memory table: index footprint, build time, query latency, and
+    where the two-stage search spends its time."""
+    head = (f"| {'scheme':<10} | NDCG@{k} | idx MB | B/tok | build s | mean ms |"
+            f" p50 ms | p95 ms | probe/rank/rescore % |")
+    print("\n" + head)
+    print("|" + "|".join("-" * len(c) for c in head.split("|")[1:-1]) + "|")
+    for s in schemes:
+        r = results[s]
+        ms = r["lat"] * 1e3
+        build = f"{r['build_s']:6.1f}" if r["build_s"] is not None else "     -"
+        st = r["stages"]
+        tot = sum(st.values())
+        frac = ("/".join(f"{100 * st.get(x, 0) / tot:.0f}" for x in ("probe", "rank", "rescore"))
+                if tot > 0 else "-")
+        print(f"| {s:<10} | {r['ndcg']:6.4f} | {r['index_mb']:6.1f} | {r['bpt']:5d} |"
+              f" {build} | {ms.mean():7.1f} | {np.percentile(ms, 50):6.1f} |"
+              f" {np.percentile(ms, 95):6.1f} | {frac:>20} |")
+    if note:
+        print(f"\n{note}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bundle", help="a bundle dir, or a directory of bundles (e.g. data/toy)")
@@ -147,6 +206,8 @@ def main():
     ap.add_argument("--backend", choices=["numpy", "rust"], default="numpy",
                     help="binary stage-2 scorer; 'rust' needs the kernels extension "
                          "(maturin develop -m kernels/Cargo.toml --release --features python)")
+    ap.add_argument("--profile", action="store_true",
+                    help="report index memory, build time, and per-stage query latency")
     args = ap.parse_args()
 
     scorer = make_rust_scorer() if args.backend == "rust" else None

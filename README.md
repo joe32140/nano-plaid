@@ -87,6 +87,26 @@ edge out exact on noise. It's for comparing *schemes*, not for headline numbers.
 | residual nbits=2 | 6.4 | 36 | 0.7313 | 95.9% | 129 |
 | binary (1-bit) | 3.2 | 20 | 0.7513 | 98.5% | 58 |
 
+## profiling (`eval.py --profile`)
+
+`--profile` adds resident index memory, build time, and a per-stage latency
+breakdown (probe / rank / rescore). On full SciFact:
+
+| scheme | index MB | build s | p50 ms | probe/rank/rescore % |
+|--------|---------:|--------:|-------:|---------------------:|
+| exact | 610 (float corpus) | – | 18.5 | – |
+| residual-4 | 85 | 15.9 | 153 | 1 / 30 / 69 |
+| binary | 28 | 3.8 | 58.6 | 2 / 72 / 27 |
+| binary `--backend rust` | 28 | – | 45.1 | 2 / 89 / 9 |
+
+Two things the breakdown makes obvious. **Memory:** the binary index is 28 MB
+against a 610 MB float corpus — 22×. **Where the time goes:** binary's `2P−T`
+rescore is so cheap it's only 27% of the query (vs 69% for residual's
+decode+GEMM), and the Rust kernel shrinks it to 9% — at which point *stage-1.5
+candidate ranking is 89% of the query* and is the next thing to optimize. That
+last part is an algorithm/numpy bottleneck, not a kernel one: profiling tells
+you the SIMD work is already done.
+
 Two honest observations, both of which are the point of the repo:
 
 - **Quality:** sign bits keep 98.5% of NDCG at 1/25th the storage — *for this
