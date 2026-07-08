@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
-data/
+# Ignore data caches (raw downloads, full encodings) but commit the toy bundle —
+# it's the artifact that makes `python eval.py data/toy` run with zero downloads.
+data/*
+!data/toy/
 kernels/target/
 Cargo.lock
 .venv/

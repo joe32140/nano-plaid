@@ -37,21 +37,48 @@ vs speed vs storage:
 ## quickstart
 
 ```bash
-pip install numpy                      # that's the whole engine
-python nanoplaid.py                    # self-test on synthetic data
+pip install numpy             # that's the whole engine
+python nanoplaid.py           # self-test on synthetic data
+python eval.py data/toy       # committed multi-domain toy — no downloads, ~30 MB
+```
 
-pip install pylate                     # encoder only (torch; GPU/MPS helps)
-python encode.py --download scifact --out data/scifact
+`data/toy` is a small slice of four [NanoBEIR](https://huggingface.co/collections/zeta-alpha-ai)
+domains (SciFact, NFCorpus, FiQA, Quora), encoded with `lightonai/LateOn-regularized`
+and checked in as fp16, so the whole quantization-vs-quality story runs in a
+minute with numpy alone. For a full dataset (needs torch) or the Rust backend:
+
+```bash
+pip install pylate            # encoder only (torch; GPU/MPS helps)
+python encode.py --nano SciFact --out data/scifact   # or --download scifact
 python eval.py data/scifact
 
-# optional: score the binary stage-2 with the Rust kernel instead of numpy
 maturin develop -m kernels/Cargo.toml --release --features python
 python eval.py data/scifact --backend rust
 ```
 
-## results (SciFact, `lightonai/LateOn-regularized`, Apple M4)
+## results
 
-5,183 docs → 1.19M token vectors, dim=128, 300 queries. One `eval.py` run:
+**The toy, reproducible right now** (`python eval.py data/toy`, NDCG@10 per
+domain, `lightonai/LateOn-regularized`, dim 128):
+
+| dataset | exact | residual-4 | residual-2 | binary |
+|---------|------:|-----------:|-----------:|-------:|
+| fiqa | 0.5974 | 0.6111 | 0.6162 | 0.5945 |
+| nfcorpus | 0.3995 | 0.4012 | 0.4022 | 0.3859 |
+| quora | 0.9868 | 0.9842 | 0.9835 | 0.9772 |
+| scifact | 0.7602 | 0.7611 | 0.6967 | 0.7443 |
+| **average** | 0.6860 | 0.6894 | 0.6747 | 0.6755 |
+
+B/token: exact 512, residual-4 68, residual-2 36, binary 20. **Binary keeps
+98.5% of exact NDCG at 1/25th the storage** — but look at the spread: 99.5% on
+FiQA down to 96.6% on NFCorpus. *Whether a corpus binarizes is domain-dependent*,
+and this table is one `--model` flag away from testing your own. (Caveats: the
+subsampled corpora make absolute NDCG unrepresentative — NFCorpus especially,
+now balanced across all 50 queries — and with 50 queries residual can tie or
+edge out exact on noise. It's for comparing *schemes*, not for headline numbers.)
+
+**At scale** (full SciFact, 5,183 docs → 1.19M tokens, 300 queries, Apple M4 —
+`encode.py --nano SciFact` then `eval.py`):
 
 | scheme | build s | bytes/token | NDCG@10 | retention | p50 ms/query |
 |--------|--------:|------------:|--------:|----------:|-------------:|
@@ -111,8 +138,10 @@ scheme here mirrors the one contributed to next-plaid in
 
 ```
 nanoplaid.py   the entire index + search engine (numpy only)
-encode.py      BEIR dataset + ColBERT model -> token-embedding bundle (pylate)
-eval.py        NDCG@10 / latency / storage for every scheme (--backend numpy|rust)
+encode.py      BEIR / NanoBEIR + ColBERT model -> token-embedding bundle (pylate)
+make_toy.py    builds the committed data/toy slice (pylate; run once, not needed to use)
+eval.py        NDCG@10 / latency / storage per scheme, one bundle or a directory of them
+data/toy/      committed fp16 4-domain NanoBEIR slice — the zero-download demo
 kernels/       the Rust SIMD ladder + optional pyo3 bridge
 pyproject.toml maturin config for the optional Rust extension
 ```

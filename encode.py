@@ -61,10 +61,28 @@ def pack(embeddings):
     return np.concatenate(embeddings, axis=0).astype(np.float32), lens
 
 
+def load_nanobeir(name):
+    """A NanoBEIR dataset (HF: zeta-alpha-ai/Nano{Name}) -> BEIR-shaped tuples.
+    50 queries, a few-thousand-doc corpus; downloads on demand for a full (not
+    subsampled) eval. make_toy.py builds the committed slice separately."""
+    from datasets import load_dataset
+    repo = f"zeta-alpha-ai/Nano{name}"
+    corpus = load_dataset(repo, "corpus", split="train")
+    queries = load_dataset(repo, "queries", split="train")
+    qrels_rows = load_dataset(repo, "qrels", split="train")
+    qrels = {}
+    for r in qrels_rows:
+        qrels.setdefault(str(r["query-id"]), {})[str(r["corpus-id"])] = 1
+    corpus_ids = [str(x) for x in corpus["_id"]]
+    query_ids = [str(x) for x in queries["_id"]]
+    return corpus_ids, list(corpus["text"]), query_ids, list(queries["text"]), qrels
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", help="BEIR dataset dir (corpus.jsonl, queries.jsonl, qrels/)")
     ap.add_argument("--download", help="BEIR dataset name to fetch (e.g. scifact)")
+    ap.add_argument("--nano", help="NanoBEIR dataset name (e.g. SciFact, FiQA2018)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="answerdotai/answerai-colbert-small-v1")
     ap.add_argument("--split", default="test")
@@ -73,22 +91,23 @@ def main():
 
     from pylate import models  # deferred: everything above is torch-free
 
-    data = Path(args.data) if args.data else download_beir(args.download, "data/beir")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    qrels = load_qrels(data / "qrels" / f"{args.split}.tsv")
-
-    corpus_ids, corpus_texts = [], []
-    for row in read_jsonl(data / "corpus.jsonl"):
-        corpus_ids.append(str(row["_id"]))
-        corpus_texts.append((row.get("title", "") + " " + row.get("text", "")).strip())
-
-    query_ids, query_texts = [], []
-    for row in read_jsonl(data / "queries.jsonl"):
-        if str(row["_id"]) in qrels:  # only queries in the eval split
-            query_ids.append(str(row["_id"]))
-            query_texts.append(row["text"])
+    if args.nano:
+        corpus_ids, corpus_texts, query_ids, query_texts, qrels = load_nanobeir(args.nano)
+    else:
+        data = Path(args.data) if args.data else download_beir(args.download, "data/beir")
+        qrels = load_qrels(data / "qrels" / f"{args.split}.tsv")
+        corpus_ids, corpus_texts = [], []
+        for row in read_jsonl(data / "corpus.jsonl"):
+            corpus_ids.append(str(row["_id"]))
+            corpus_texts.append((row.get("title", "") + " " + row.get("text", "")).strip())
+        query_ids, query_texts = [], []
+        for row in read_jsonl(data / "queries.jsonl"):
+            if str(row["_id"]) in qrels:  # only queries in the eval split
+                query_ids.append(str(row["_id"]))
+                query_texts.append(row["text"])
 
     print(f"{len(corpus_ids)} docs, {len(query_ids)} queries; encoding with {args.model}")
     model = models.ColBERT(model_name_or_path=args.model)
