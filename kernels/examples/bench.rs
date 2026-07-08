@@ -79,11 +79,15 @@ fn main() {
     let t1 = best_of(|| docs_f32.iter().map(|d| maxsim_f32(&q_deq, d, DIM)).sum());
     let t2 = best_of(|| docs.iter().map(|b| maxsim_scalar(&q, b, DIM)).sum());
     let t3 = best_of(|| docs.iter().map(|b| maxsim_autovec(&q, b, DIM)).sum());
-    // Fused rungs only exist on a CPU with the feature; probe once, then time.
-    let t4 = maxsim_sdot(&q, &docs[0], DIM)
+    // Rung 4/5: the fused doc-token-outer kernels — whichever this CPU supports
+    // (aarch64: SDOT, and SMMLA where i8mm exists; x86_64: AVX2 SAD). Probe once
+    // so unsupported kernels cost nothing, then time the ones that ran.
+    let t_sdot = maxsim_sdot(&q, &docs[0], DIM)
         .map(|_| best_of(|| docs.iter().map(|b| maxsim_sdot(&q, b, DIM).unwrap()).sum()));
-    let t5 = maxsim_smmla(&q, &docs[0], DIM)
+    let t_smmla = maxsim_smmla(&q, &docs[0], DIM)
         .map(|_| best_of(|| docs.iter().map(|b| maxsim_smmla(&q, b, DIM).unwrap()).sum()));
+    let t_avx2 = maxsim_avx2(&q, &docs[0], DIM)
+        .map(|_| best_of(|| docs.iter().map(|b| maxsim_avx2(&q, b, DIM).unwrap()).sum()));
 
     let us = |d: Duration| d.as_secs_f64() * 1e6 / N_DOCS as f64;
     let rel = |d: Duration| t1.as_secs_f64() / d.as_secs_f64();
@@ -91,18 +95,24 @@ fn main() {
         println!("  {name}  {:>8.3} us/doc   {:>5.2}x", us(t), rel(t));
     };
     println!("per-doc latency (lower is better; speedup vs rung 1):");
-    line("rung 1  f32 reference  ", t1);
-    line("rung 2  2P-T scalar    ", t2);
-    line("rung 3  autovectorized ", t3);
-    match t4 {
-        Some(t) => line("rung 4  fused SDOT     ", t),
-        None => println!("  rung 4  fused SDOT      (no dotprod on this CPU)"),
+    line("rung 1  f32 reference   ", t1);
+    line("rung 2  2P-T scalar     ", t2);
+    line("rung 3  autovectorized  ", t3);
+    let mut any_fused = false;
+    for (name, t) in [
+        ("rung 4  fused NEON SDOT ", t_sdot),
+        ("rung 5  fused NEON SMMLA", t_smmla),
+        ("rung 4  fused AVX2 SAD  ", t_avx2),
+    ] {
+        if let Some(t) = t {
+            line(name, t);
+            any_fused = true;
+        }
     }
-    match t5 {
-        Some(t) => line("rung 5  fused SMMLA    ", t),
-        None => println!("  rung 5  fused SMMLA     (no i8mm on this CPU)"),
+    if !any_fused {
+        println!("  (no fused kernel for this CPU — needs aarch64 dotprod or x86 avx2)");
     }
-    if let (Some(a), Some(b)) = (t4, t5) {
+    if let (Some(a), Some(b)) = (t_sdot, t_smmla) {
         println!(
             "\n  SMMLA vs SDOT: {:.2}x",
             a.as_secs_f64() / b.as_secs_f64()

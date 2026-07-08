@@ -8,14 +8,16 @@
 //!   rung 1  `maxsim_f32`      the float reference — what we are approximating
 //!   rung 2  `maxsim_scalar`   the 2P − T identity, one branch per bit
 //!   rung 3  `maxsim_autovec`  branchless masks, written so LLVM autovectorizes
-//!   rung 4  `maxsim_neon128`  fused doc-token-outer NEON SDOT (aarch64, dim 128)
+//!   rung 4  fused doc-token-outer, the platform's SIMD:
+//!             `maxsim_neon128`      NEON SDOT   (aarch64 + dotprod)
+//!             `maxsim_avx2_sad128`  AVX2 SAD    (x86_64 + avx2)
 //!   rung 5  `maxsim_smmla128` fused SMMLA — half the instructions, but only
 //!                             ties rung 4 on the M4 (see its comment)
 //!
-//! `maxsim` dispatches to the best available rung at runtime (rung 4 on Apple
-//! Silicon — rung 5 ties, so it isn't preferred). Rungs left as exercises (see
-//! README.md): portable `std::simd`, AVX2 masked-SAD and AVX-512 VNNI —
-//! production versions of all three live in next-plaid.
+//! `maxsim` dispatches to the best available rung at runtime: SDOT on Apple
+//! Silicon, AVX2 on x86, autovec elsewhere. Rungs left as exercises (see
+//! README.md): portable `std::simd` and AVX-512 VNNI (faster than AVX2 but far
+//! less universal) — production versions of all live in next-plaid.
 //!
 //! Layouts, chosen for kernels rather than ergonomics: a query is `nq` rows of
 //! `dim` values flattened into one slice; a binary document is `nd` rows of
@@ -42,6 +44,10 @@ pub struct QueryI8 {
     /// reads as two 8-wide rows. Same plane order as `planes`, so it dots
     /// against the same `extract_planes_128` doc bytes.
     pub planes_smmla: Vec<i8>,
+    /// Row-major biased codes (`x ^ 0x80`, i.e. `x + 128` as `u8`) — the query
+    /// layout the AVX2 masked-SAD kernel consumes, where the sum of selected
+    /// biased bytes is `P + 128·popcount(bits)`.
+    pub biased: Vec<u8>,
 }
 
 pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
@@ -101,6 +107,8 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
     } else {
         Vec::new()
     };
+    // Biased u8 codes for the AVX2 masked-SAD kernel (row-major, all dims).
+    let biased = values.iter().map(|&x| (x as u8) ^ 0x80).collect();
     QueryI8 {
         dim,
         values,
@@ -108,6 +116,7 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
         sums,
         planes,
         planes_smmla,
+        biased,
     }
 }
 
@@ -480,6 +489,101 @@ mod neon {
 }
 
 // ---------------------------------------------------------------------------
+// The x86 rung 4: AVX2 masked-SAD (dim = 128), the same doc-token-outer idea as
+// NEON SDOT but with the trick that fits x86's instruction set. It needs only
+// AVX2, so it runs on essentially every x86_64 machine built since ~2013 -- the
+// fused kernel Linux/x86 developers get. (AVX-512 VNNI is faster still where
+// available; it's left as the README exercise since it's far less universal.)
+//
+// Expand each doc token's 128 bits ONCE into four ymm of 0xFF/0x00 masks
+// (broadcast + pshufb + pcmpeqb), amortized over all query tokens. Scoring uses
+// the biased-SAD identity: with the query stored as u8 `qb = q + 128`,
+// `SAD(qb & mask, 0) = P + 128·popcount(bits)`, so `P = SAD − 128·popcount` and
+// `score = 2P − T`. Every scoring op (pand / psadbw / paddq) is a cheap 1-µop
+// instruction -- no widening multiply chains.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    /// # Safety
+    /// Requires `avx2`; `q.biased` must be populated (dim == 128) and
+    /// `bits.len() == n_d * 16`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn maxsim_avx2_sad128(q: &super::QueryI8, bits: &[u8]) -> f32 {
+        let n_q = q.sums.len();
+        let n_d = bits.len() / 16;
+        // Broadcast byte k of a 4-byte word to lanes 8k..8k+8, then AND with the
+        // MSB-first bit selector and compare-equal -> a 0xFF/0x00 mask per dim.
+        const IDX: [i8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        ];
+        const SEL: [i8; 32] = [
+            -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04,
+            0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10,
+            0x08, 0x04, 0x02, 0x01,
+        ];
+        let idx = _mm256_loadu_si256(IDX.as_ptr() as *const __m256i);
+        let sel = _mm256_loadu_si256(SEL.as_ptr() as *const __m256i);
+        let zero = _mm256_setzero_si256();
+
+        // 0xFF mask ymm for dims 32g..32g+32 of the token at `bp`.
+        macro_rules! mask32 {
+            ($bp:expr, $g:expr) => {{
+                let w = ($bp.add($g * 4) as *const u32).read_unaligned();
+                let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(w as i32), idx);
+                _mm256_cmpeq_epi8(_mm256_and_si256(bytes, sel), sel)
+            }};
+        }
+
+        let mut best = vec![i32::MIN; n_q];
+        let qp = q.biased.as_ptr();
+        for d in 0..n_d {
+            let bp = bits.as_ptr().add(d * 16);
+            let m0 = mask32!(bp, 0);
+            let m1 = mask32!(bp, 1);
+            let m2 = mask32!(bp, 2);
+            let m3 = mask32!(bp, 3);
+            let cnt = ((bp as *const u64).read_unaligned().count_ones()
+                + (bp.add(8) as *const u64).read_unaligned().count_ones())
+                as i32;
+            for (qi, best_qi) in best.iter_mut().enumerate() {
+                let q0 = qp.add(qi * 128);
+                let s0 = _mm256_sad_epu8(
+                    _mm256_and_si256(m0, _mm256_loadu_si256(q0 as *const __m256i)),
+                    zero,
+                );
+                let s1 = _mm256_sad_epu8(
+                    _mm256_and_si256(m1, _mm256_loadu_si256(q0.add(32) as *const __m256i)),
+                    zero,
+                );
+                let s2 = _mm256_sad_epu8(
+                    _mm256_and_si256(m2, _mm256_loadu_si256(q0.add(64) as *const __m256i)),
+                    zero,
+                );
+                let s3 = _mm256_sad_epu8(
+                    _mm256_and_si256(m3, _mm256_loadu_si256(q0.add(96) as *const __m256i)),
+                    zero,
+                );
+                let s = _mm256_add_epi64(_mm256_add_epi64(s0, s1), _mm256_add_epi64(s2, s3));
+                let x = _mm_add_epi64(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
+                let sad = _mm_cvtsi128_si64(_mm_add_epi64(x, _mm_unpackhi_epi64(x, x))) as i32;
+                // SAD = P + 128·popcount, so P = SAD − 128·cnt; score = 2P − T.
+                let score = 2 * (sad - 128 * cnt) - q.sums[qi];
+                if score > *best_qi {
+                    *best_qi = score;
+                }
+            }
+        }
+        let mut total = 0.0f32;
+        for (qi, &scale) in q.scales.iter().enumerate() {
+            total += best[qi] as f32 * scale;
+        }
+        total
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch: pick the best rung this CPU can run. Feature detection happens at
 // RUNTIME — compiling with the feature enabled and shipping the binary to a
 // core without it is a SIGILL. This is why production code can't just build
@@ -491,6 +595,10 @@ pub fn maxsim(q: &QueryI8, bits: &[u8], dim: usize) -> f32 {
     // for the bench and for cores that may issue it faster.
     #[cfg(target_arch = "aarch64")]
     if let Some(v) = maxsim_sdot(q, bits, dim) {
+        return v;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(v) = maxsim_avx2(q, bits, dim) {
         return v;
     }
     maxsim_autovec(q, bits, dim)
@@ -513,6 +621,17 @@ pub fn maxsim_smmla(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
     #[cfg(target_arch = "aarch64")]
     if dim == 128 && !q.planes_smmla.is_empty() && std::arch::is_aarch64_feature_detected!("i8mm") {
         return Some(unsafe { neon::maxsim_smmla128(q, bits) });
+    }
+    None
+}
+
+/// The x86 fused kernel (AVX2 masked-SAD) if this CPU has `avx2` and
+/// `dim == 128`, else `None`. The x86 analog of `maxsim_sdot`.
+#[allow(unused_variables)]
+pub fn maxsim_avx2(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if dim == 128 && !q.biased.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
+        return Some(unsafe { x86::maxsim_avx2_sad128(q, bits) });
     }
     None
 }
@@ -565,6 +684,9 @@ mod tests {
             }
             if let Some(v) = maxsim_smmla(&q, &bits, dim) {
                 assert_eq!(a, v, "smmla ({nq},{nd},{dim})");
+            }
+            if let Some(v) = maxsim_avx2(&q, &bits, dim) {
+                assert_eq!(a, v, "avx2 ({nq},{nd},{dim})");
             }
         }
     }

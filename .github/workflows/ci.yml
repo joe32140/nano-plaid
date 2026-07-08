@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Rust runs on both arches so both fused kernels are actually executed:
+  # ubuntu-latest is x86_64 with AVX2 (verifies maxsim_avx2_sad128), macos-latest
+  # is arm64 with dotprod (verifies maxsim_neon128). The all_rungs_agree test
+  # asserts each available kernel is bit-identical to the scalar reference.
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: kernels
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
+  # The numpy engine: self-test plus the committed toy bundle end-to-end.
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - run: python nanoplaid.py
+      - run: python eval.py data/toy --n-full 64

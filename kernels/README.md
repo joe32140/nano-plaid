@@ -18,6 +18,12 @@ faster, all returning **bit-identical** scores:
 (32-token query × 2000 docs × 80 tokens, dim=128, Apple M4,
 `cargo run --release --example bench`.)
 
+**On x86_64** rung 4 is `maxsim_avx2_sad128` (AVX2 masked-SAD) instead of NEON
+SDOT — same fused doc-token-outer idea, same bit-identical scores, AVX2-only so
+it runs on essentially any Linux/x86 machine. The bench prints whichever fused
+kernel your CPU supports; the dispatcher (`maxsim`) picks it automatically, so
+`eval.py --backend rust` accelerates binary scoring on x86 too.
+
 Read the table before the code: **the algebraic identity is not the speedup.**
 Rung 2 is *slower* than the float loop it replaces — branching per bit costs
 more than multiplying floats. The identity's real contribution is making the
@@ -86,11 +92,12 @@ Each has a production answer in
 
 1. **Portable SIMD** — rewrite rung 3 with nightly `std::simd`. How close to
    rung 4 can a platform-independent kernel get?
-2. **AVX2 masked-SAD** — x86 without VNNI: bias the query to u8, then
-   `psadbw(qb & mask, 0) = P + 128·popcount(mask)`. (`maxsim_avx2_sad128`)
-3. **AVX-512 VNNI** — `vpdpbusd` is SDOT's x86 cousin. (`maxsim_vnni128`)
-4. **Other dims** — rung 4 hardcodes dim=128. Generalize to any multiple of
+2. **AVX-512 VNNI** — `vpdpbusd` is SDOT's exact x86 cousin, faster than the
+   AVX2 rung where a CPU has it. Port `maxsim_vnni128` from next-plaid and add
+   it above AVX2 in the dispatch. (Less universal, which is why AVX2 is the
+   shipped x86 kernel and this is the exercise.)
+3. **Other dims** — rung 4 hardcodes dim=128. Generalize to any multiple of
    32; measure what zero-padding dim=48 to 64 costs vs the fallback.
-5. **Store the expansion?** Precompute each doc token's 128 expanded bytes at
+4. **Store the expansion?** Precompute each doc token's 128 expanded bytes at
    index time and skip `extract_planes_128`. Measure why this *loses* (hint:
    16 B vs 128 B of memory traffic per token).

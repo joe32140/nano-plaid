@@ -7,6 +7,9 @@
      chrome --headless --force-device-scale-factor=2 --window-size=1200,400 \
        --screenshot=assets/banner.png file://$PWD/assets/banner.svg -->
 
+<p align="center">
+  <a href="https://github.com/joe32140/nano-plaid/actions/workflows/ci.yml"><img src="https://github.com/joe32140/nano-plaid/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
 
 # nano-plaid
 
@@ -161,14 +164,14 @@ Two honest observations, both of which are the point of the repo:
 ## the kernel ladder (`kernels/`)
 
 The one inner loop that matters — int8 query × packed 1-bit docs MaxSim —
-rebuilt in Rust as five rungs, from scalar reference to a fused NEON SDOT
-kernel, all bit-identical, benchmarked on the way up (spoiler: the algebraic
-identity alone makes things *slower*; the memory layout and loop order are
-the speedup — 38× by rung 4). Rung 5 swaps SDOT for the denser SMMLA matrix
-instruction, which *should* be 2× and instead ties — a measured lesson in why
-you don't trust a MAC count without running it. Plus field notes on the three
-ways microbenchmarks lied to us while building the production version. See
-[kernels/README.md](kernels/README.md).
+rebuilt in Rust as five rungs, from scalar reference to a fused SIMD kernel
+(NEON SDOT on Apple Silicon, AVX2 masked-SAD on x86/Linux), all bit-identical,
+benchmarked on the way up (spoiler: the algebraic identity alone makes things
+*slower*; the memory layout and loop order are the speedup — 38× by rung 4).
+Rung 5 swaps SDOT for the denser SMMLA matrix instruction, which *should* be
+2× and instead ties — a measured lesson in why you don't trust a MAC count
+without running it. Plus field notes on the three ways microbenchmarks lied to
+us while building the production version. See [kernels/README.md](kernels/README.md).
 
 A thin [pyo3 bridge](kernels/src/python.rs) exposes the top rung to numpy, so
 `eval.py --backend rust` scores the binary stage-2 with the SDOT kernel —
