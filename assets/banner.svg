@@ -38,9 +38,6 @@
     <text x="386" y="266" text-anchor="middle">laptop-scale</text>
   </g>
 
-  <!-- divider -->
-  <line x1="492" y1="58" x2="492" y2="342" stroke="#30363d" stroke-width="1"/>
-
   <!-- right: storage vs quality -->
   <text x="522" y="86" font-size="14" fill="#768390" letter-spacing="0.3">document storage — bytes/token, and NDCG@10 kept</text>
 

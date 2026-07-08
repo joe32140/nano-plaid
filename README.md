@@ -110,6 +110,7 @@ breakdown (probe / rank / rescore). On full SciFact:
 |--------|---------:|--------:|-------:|---------------------:|
 | exact | 610 (float corpus) | – | 18.4 | – |
 | residual-4 | 85 | 16 | 113 | 0 / 0 / 99 |
+| residual-2 | 47 | 6.7 | 81 | 1 / 1 / 99 |
 | binary | 28 | 3.7 | 18.1 | 4 / 3 / 94 |
 | binary `--backend rust` | 28 | – | 5.7 | 10 / 7 / 82 |
 
@@ -121,6 +122,12 @@ has. That also means the Rust kernel now pays for itself: it attacks the
 dominant cost, taking binary from 18 → 5.7 ms (3.3× under exhaustive). The
 lesson is the ordering: the SIMD kernel was worthless until pruning made
 rescore the bottleneck; profile first, optimize the tall bar.
+
+`--backend rust` is **binary-only** — residual-4/residual-2 stay 113/81 ms
+whichever backend you pass, because their rescore is a `decode → BLAS matmul`
+and BLAS is already the fast path a hand kernel can't beat (that's rung C of
+the [kernel ladder](kernels/README.md)). The 1-bit `2P−T` scoring is the only
+thing worth a custom SIMD kernel.
 
 **The knob that matters is `n_full`** — how many candidates get exact-rescored.
 Since rescore dominates, it's the recall/latency dial (binary, SciFact):
