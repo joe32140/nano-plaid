@@ -1,7 +1,12 @@
 <p align="center">
-  <img src="assets/banner.svg" width="100%"
+  <img src="assets/banner.png" width="100%"
        alt="nano-plaid — late-interaction retrieval (ColBERT + PLAID) in one numpy file. 1-bit documents: 25x smaller, 97.8% of exhaustive NDCG, 3.3x faster with SIMD kernels.">
 </p>
+
+<!-- banner.png is exported from assets/banner.svg (the editable source):
+     chrome --headless --force-device-scale-factor=2 --window-size=1200,400 \
+       --screenshot=assets/banner.png file://$PWD/assets/banner.svg -->
+
 
 # nano-plaid
 
@@ -116,6 +121,17 @@ has. That also means the Rust kernel now pays for itself: it attacks the
 dominant cost, taking binary from 18 → 5.7 ms (3.3× under exhaustive). The
 lesson is the ordering: the SIMD kernel was worthless until pruning made
 rescore the bottleneck; profile first, optimize the tall bar.
+
+**The knob that matters is `n_full`** — how many candidates get exact-rescored.
+Since rescore dominates, it's the recall/latency dial (binary, SciFact):
+
+| `n_full` | 128 | 256 | 512 | 1024 | 2048 |
+|----------|----:|----:|----:|-----:|-----:|
+| NDCG@10 | 0.642 | 0.685 | 0.726 | 0.746 | 0.750 |
+| p50 ms | 3.2 | 5.3 | 9.4 | 17.7 | 34.7 |
+
+`n_probe` (centroids probed per query token), by contrast, barely moves either —
+the candidate scoring is cheap regardless, so 2–4 is plenty.
 
 Two honest observations, both of which are the point of the repo:
 
