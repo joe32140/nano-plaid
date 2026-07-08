@@ -63,15 +63,15 @@ domain, `lightonai/LateOn-regularized`, dim 128):
 
 | dataset | exact | residual-4 | residual-2 | binary |
 |---------|------:|-----------:|-----------:|-------:|
-| fiqa | 0.5974 | 0.6111 | 0.6162 | 0.5945 |
-| nfcorpus | 0.3995 | 0.4012 | 0.4022 | 0.3859 |
+| fiqa | 0.5974 | 0.6076 | 0.6067 | 0.5899 |
+| nfcorpus | 0.3995 | 0.3889 | 0.3818 | 0.3741 |
 | quora | 0.9868 | 0.9842 | 0.9835 | 0.9772 |
-| scifact | 0.7602 | 0.7611 | 0.6967 | 0.7443 |
-| **average** | 0.6860 | 0.6894 | 0.6747 | 0.6755 |
+| scifact | 0.7602 | 0.7453 | 0.6972 | 0.7314 |
+| **average** | 0.6860 | 0.6815 | 0.6673 | 0.6681 |
 
 B/token: exact 512, residual-4 68, residual-2 36, binary 20. **Binary keeps
-98.5% of exact NDCG at 1/25th the storage** — but look at the spread: 99.5% on
-FiQA down to 96.6% on NFCorpus. *Whether a corpus binarizes is domain-dependent*,
+97.4% of exact NDCG at 1/25th the storage** — but look at the spread: 99.0% on
+Quora down to 93.6% on NFCorpus. *Whether a corpus binarizes is domain-dependent*,
 and this table is one `--model` flag away from testing your own. (Caveats: the
 subsampled corpora make absolute NDCG unrepresentative — NFCorpus especially,
 now balanced across all 50 queries — and with 50 queries residual can tie or
@@ -82,10 +82,14 @@ edge out exact on noise. It's for comparing *schemes*, not for headline numbers.
 
 | scheme | build s | bytes/token | NDCG@10 | retention | p50 ms/query |
 |--------|--------:|------------:|--------:|----------:|-------------:|
-| exhaustive f32 | – | 512 | 0.7629 | 100% | 19 |
-| residual nbits=4 | 16.5 | 68 | 0.7591 | 99.5% | 154 |
-| residual nbits=2 | 6.4 | 36 | 0.7313 | 95.9% | 129 |
-| binary (1-bit) | 3.2 | 20 | 0.7513 | 98.5% | 58 |
+| exhaustive f32 | – | 512 | 0.7629 | 100% | 18 |
+| residual nbits=4 | 16 | 68 | 0.7551 | 99.0% | 113 |
+| residual nbits=2 | 6.7 | 36 | 0.7357 | 96.4% | 81 |
+| binary (1-bit) | 3.7 | 20 | 0.7460 | 97.8% | 18 |
+
+Binary matches exhaustive latency (18 ms) at 1/25th the storage; with the Rust
+kernel (`--backend rust`) it drops to **5.7 ms — 3.3× faster than exhaustive**,
+28 MB against a 610 MB float corpus.
 
 ## profiling (`eval.py --profile`)
 
@@ -94,18 +98,19 @@ breakdown (probe / rank / rescore). On full SciFact:
 
 | scheme | index MB | build s | p50 ms | probe/rank/rescore % |
 |--------|---------:|--------:|-------:|---------------------:|
-| exact | 610 (float corpus) | – | 18.5 | – |
-| residual-4 | 85 | 15.9 | 153 | 1 / 30 / 69 |
-| binary | 28 | 3.8 | 58.6 | 2 / 72 / 27 |
-| binary `--backend rust` | 28 | – | 45.1 | 2 / 89 / 9 |
+| exact | 610 (float corpus) | – | 18.4 | – |
+| residual-4 | 85 | 16 | 113 | 0 / 0 / 99 |
+| binary | 28 | 3.7 | 18.1 | 4 / 3 / 94 |
+| binary `--backend rust` | 28 | – | 5.7 | 10 / 7 / 82 |
 
 Two things the breakdown makes obvious. **Memory:** the binary index is 28 MB
-against a 610 MB float corpus — 22×. **Where the time goes:** binary's `2P−T`
-rescore is so cheap it's only 27% of the query (vs 69% for residual's
-decode+GEMM), and the Rust kernel shrinks it to 9% — at which point *stage-1.5
-candidate ranking is 89% of the query* and is the next thing to optimize. That
-last part is an algorithm/numpy bottleneck, not a kernel one: profiling tells
-you the SIMD work is already done.
+against a 610 MB float corpus — 22×. **Where the time goes:** thanks to
+centroid pruning (stage 1.5), the candidate set is small, so *exact rescore
+dominates* — 82–99% of the query — exactly the shape a real product profile
+has. That also means the Rust kernel now pays for itself: it attacks the
+dominant cost, taking binary from 18 → 5.7 ms (3.3× under exhaustive). The
+lesson is the ordering: the SIMD kernel was worthless until pruning made
+rescore the bottleneck; profile first, optimize the tall bar.
 
 Two honest observations, both of which are the point of the repo:
 
@@ -139,9 +144,9 @@ ways microbenchmarks lied to us while building the production version. See
 
 A thin [pyo3 bridge](kernels/src/python.rs) exposes the top rung to numpy, so
 `eval.py --backend rust` scores the binary stage-2 with the SDOT kernel —
-identical NDCG@10 (0.7513). Measured back-to-back on SciFact, swapping only
-that stage cuts end-to-end p50 from ~57ms to ~44ms; the rest of the two-stage
-pipeline stays numpy, so Amdahl's law caps the win at rescoring's share of it.
+identical NDCG@10 (0.7460). Because centroid pruning makes rescore the dominant
+cost, swapping that stage cuts SciFact end-to-end p50 from ~18 ms to ~5.7 ms
+(3.2×) — the kernel now attacks the tall bar instead of a rounding error.
 
 ## relationship to next-plaid
 

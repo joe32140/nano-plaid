@@ -352,22 +352,34 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None, timings=N
     clock = _StageClock(timings)
     q = np.ascontiguousarray(q, dtype=np.float32)
     cs = q @ index.centroids.T                                   # [nq, K]
+    nq = cs.shape[0]
 
-    # Stage 1: candidate docs from the inverted file.
+    # Stage 1: each query token probes its top n_probe centroids.
     probes = np.argpartition(-cs, n_probe - 1, axis=1)[:, :n_probe]
-    cand = np.unique(np.concatenate(
-        [index.ivf_docs[index.ivf_offsets[c] : index.ivf_offsets[c + 1]]
-         for c in probes.ravel()] or [np.empty(0, np.int32)]))
-    if len(cand) == 0:
-        return np.empty(0, np.int64), np.empty(0, np.float32)
     clock.mark("probe")
 
-    # Stage 1.5: approximate scores from centroid ids alone.
-    rows, bounds = _gather_rows(index, cand)
-    approx = np.maximum.reduceat(cs[:, index.codes[rows]], bounds, axis=1).sum(axis=0)
+    # Stage 1.5 (centroid interaction / pruning): approximate each doc's MaxSim
+    # using ONLY the probed centroids, scattered through the inverted file -- no
+    # per-token [nq, tokens] matrix. Per query token, a doc scores its best
+    # probed-centroid hit, summed over query tokens. This both generates
+    # candidates (docs a probed centroid touches) and ranks them cheaply, so
+    # only the top n_full reach the exact rescore -- PLAID's centroid pruning,
+    # and the reason this stage is a small slice instead of scoring the corpus.
+    approx = np.zeros(index.n_docs, dtype=np.float32)
+    for qi in range(nq):
+        docs_per_c = [index.ivf_docs[index.ivf_offsets[c] : index.ivf_offsets[c + 1]]
+                      for c in probes[qi]]
+        docs = np.concatenate(docs_per_c)
+        scores = np.repeat(cs[qi, probes[qi]], [len(d) for d in docs_per_c])
+        contrib = np.zeros(index.n_docs, dtype=np.float32)
+        np.maximum.at(contrib, docs, scores)   # this token's best centroid, per doc
+        approx += contrib
+    cand = np.nonzero(approx)[0]
+    if len(cand) == 0:
+        return np.empty(0, np.int64), np.empty(0, np.float32)
     if len(cand) > n_full:
-        cand = cand[np.sort(np.argpartition(-approx, n_full - 1)[:n_full])]
-        rows, bounds = _gather_rows(index, cand)
+        cand = cand[np.argpartition(-approx[cand], n_full - 1)[:n_full]]
+    rows, bounds = _gather_rows(index, cand)
     clock.mark("rank")
 
     # Stage 2: exact rescore of the survivors. The Rust kernel returns per-doc
