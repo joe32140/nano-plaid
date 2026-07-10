@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Class 01 · SIMD from zero — nano-plaid SIMD school</title>
+<link rel="stylesheet" href="course.css">
+</head>
+<body>
+<div class="course-bar">
+  <span class="brand">nano-plaid · SIMD school</span>
+  <nav class="tabs" aria-label="Classes">
+    <a href="./" class="tab active">Class 01 · SIMD from zero</a>
+    <a href="class2.html" class="tab">Class 02 · the 1-bit × int8 kernel</a>
+    <a href="https://github.com/joe32140/nano-plaid" class="tab">repo ↗</a>
+  </nav>
+</div>
+
+
+<main>
+<!-- ═══════════════ HERO ═══════════════ -->
+<header>
+  <span class="eyebrow">an interactive field guide · <b>no prior knowledge assumed</b></span>
+  <h1>Your CPU can do sixteen multiplications in one instruction.</h1>
+  <div class="hero-reg" id="heroReg" aria-hidden="true"></div>
+  <p class="hero-sub">That trick is called <b>SIMD</b> — <em>Single Instruction, Multiple Data</em> —
+  and it's how search engines, video codecs, and neural networks squeeze 10–40× more work out of
+  the same silicon. This page teaches it from zero, with the machinery running live in front of you,
+  and ends at real kernels measured on an Apple M4 and an x86 Linux box.</p>
+
+  <nav class="toc" aria-label="Chapters">
+    <span class="eyebrow">chapters — in order, each builds on the last</span>
+    <ol>
+      <li><a href="#c1"><span class="n">01</span> The race: scalar vs SIMD</a></li>
+      <li><a href="#c2"><span class="n">02</span> Registers &amp; lanes</a></li>
+      <li><a href="#c3"><span class="n">03</span> Lane-wise operations</a></li>
+      <li><a href="#c4"><span class="n">04</span> The horizontal tax</a></li>
+      <li><a href="#c5"><span class="n">05</span> Two worlds: x86 &amp; ARM</a></li>
+      <li><a href="#c6"><span class="n">06</span> Dot-product instructions</a></li>
+      <li><a href="#c7"><span class="n">07</span> Three ways to get SIMD</a></li>
+      <li><a href="#c8"><span class="n">08</span> Dispatch &amp; the traps</a></li>
+      <li><a href="#c9"><span class="n">09</span> Case study: a real kernel</a></li>
+      <li><a href="#c10"><span class="n">10</span> Check yourself</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ═══════════════ 01 RACE ═══════════════ -->
+<section id="c1">
+  <span class="eyebrow">01 · the whole idea in one picture</span>
+  <h2>Scalar vs SIMD: a race</h2>
+  <p class="lede">A normal ("scalar") instruction touches <em>one</em> number at a time.
+  A SIMD instruction touches a whole row of them. Same task below — double 32 numbers —
+  two ways. Press run.</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">task: multiply every number by 2</span>
+      <div class="controls">
+        <button class="primary" id="raceRun">▶ run the race</button>
+        <button id="raceStep">step once</button>
+        <button id="raceReset">reset</button>
+      </div>
+    </div>
+    <div class="race-grid">
+      <div class="race-side">
+        <div class="head">
+          <span class="who" style="color:var(--ch-a)">SCALAR — 1 number / instruction</span>
+          <span class="steps">instructions: <b id="scalarCount">0</b></span>
+        </div>
+        <div class="race-cells" id="scalarCells"></div>
+      </div>
+      <div class="race-side">
+        <div class="head">
+          <span class="who" style="color:var(--ch-b)">SIMD — 8 numbers / instruction</span>
+          <span class="steps">instructions: <b id="simdCount">0</b></span>
+        </div>
+        <div class="race-cells" id="simdCells"></div>
+      </div>
+    </div>
+    <div class="winner" id="raceWinner" aria-live="polite"></div>
+    <p class="note">The SIMD side isn't running faster clock cycles — it's issuing <b>fewer
+    instructions</b>, each carrying 8 numbers. That's the entire premise. Everything else on
+    this page is about what "a row of numbers" means and what you're allowed to do to it.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ 02 REGISTERS ═══════════════ -->
+<section id="c2">
+  <span class="eyebrow">02 · where the row of numbers lives</span>
+  <h2>Registers &amp; lanes</h2>
+  <p class="lede">A SIMD register is just a fixed-width box of bits — 128, 256, or 512 of them,
+  depending on the CPU. <em>You</em> choose how to slice it: into 8-bit, 16-bit, or 32-bit
+  pieces. Each piece is a <strong>lane</strong>, and every lane gets the same operation.</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">lane explorer — slice a register yourself</span>
+    </div>
+    <div class="controls" style="gap:18px">
+      <div>
+        <div class="eyebrow" style="margin-bottom:6px">register width</div>
+        <div class="seg" role="group" aria-label="register width" id="segWidth">
+          <button data-w="128" aria-pressed="true">128-bit</button>
+          <button data-w="256" aria-pressed="false">256-bit</button>
+          <button data-w="512" aria-pressed="false">512-bit</button>
+        </div>
+      </div>
+      <div>
+        <div class="eyebrow" style="margin-bottom:6px">element type</div>
+        <div class="seg" role="group" aria-label="element type" id="segType">
+          <button data-b="8"  data-t="int8"  aria-pressed="true">int8</button>
+          <button data-b="16" data-t="int16" aria-pressed="false">int16</button>
+          <button data-b="32" data-t="int32" aria-pressed="false">int32</button>
+          <button data-b="32" data-t="float32" aria-pressed="false">float32</button>
+        </div>
+      </div>
+    </div>
+    <div class="explorer-out">
+      <div class="exp-summary" id="expSummary"></div>
+      <div class="exp-strip" id="expStrip" aria-hidden="true"></div>
+      <div class="exp-meta" id="expMeta"></div>
+    </div>
+    <p class="note"><b>Try it:</b> 128-bit register + int8 → 16 lanes. Switch to 512-bit + int8
+    → 64 lanes. Same instruction cost, 4× the data. This is why quantizing neural-net values
+    from float32 down to int8 isn't just a memory trick — it literally multiplies how many
+    numbers fit per instruction.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ 03 LANE OPS ═══════════════ -->
+<section id="c3">
+  <span class="eyebrow">03 · what one instruction does</span>
+  <h2>Lane-wise operations</h2>
+  <p class="lede">The bread and butter: take two registers, apply one operation
+  <em>independently in every lane</em>, get a register of results. No lane ever talks to its
+  neighbor. Pick an operation and execute it.</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">8 × int16 lanes</span>
+      <div class="controls">
+        <div class="seg" role="group" aria-label="operation" id="segOp">
+          <button data-op="add" aria-pressed="true">add</button>
+          <button data-op="mul" aria-pressed="false">mul</button>
+          <button data-op="max" aria-pressed="false">max</button>
+          <button data-op="cmpgt" aria-pressed="false">cmp &gt;</button>
+        </div>
+        <button class="primary" id="opRun">execute</button>
+      </div>
+    </div>
+    <div class="strip-row"><span class="strip-label">A</span><div class="strip" id="opA"></div></div>
+    <div class="strip-row"><span class="strip-label" id="opSym">A + B</span><div class="strip" id="opB"></div></div>
+    <div class="strip-row"><span class="strip-label">result</span><div class="strip" id="opR"></div></div>
+    <p class="note" id="opNote">Lane-wise add: each result lane is <code>A[i] + B[i]</code>. One
+    instruction, eight independent adds.</p>
+  </div>
+
+  <p>The sleeper hit is <strong>compare</strong>. It doesn't produce true/false — it produces a
+  <strong>mask</strong>: all-ones (<code>FFFF</code>) where the test passed, all-zeros where it
+  failed. AND-ing data with a mask keeps some lanes and zeroes others — which is how SIMD code
+  does "if" <em>without branching</em>. Hold that thought; the case study in chapter 09 is built
+  on exactly this.</p>
+</section>
+
+<!-- ═══════════════ 04 HORIZONTAL ═══════════════ -->
+<section id="c4">
+  <span class="eyebrow">04 · the catch</span>
+  <h2>The horizontal tax</h2>
+  <p class="lede">SIMD is blazing <em>across</em> lanes ("vertical") and awkward <em>within</em> a
+  register ("horizontal"). Summing all lanes into one number takes log₂(lanes) rounds of
+  shuffling — watch:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">horizontal sum: 8 lanes → 1 value</span>
+      <div class="controls">
+        <button class="primary" id="treeStep">pairwise-add round</button>
+        <button id="treeReset">reset</button>
+      </div>
+    </div>
+    <div id="treeArea"></div>
+    <p class="note" id="treeNote">Each round adds neighbors: 8 → 4 → 2 → 1. Three instructions
+    just to fold one register — while a single lane-wise add would have processed 8 fresh numbers
+    in the same time.</p>
+  </div>
+
+  <p>Consequence: good SIMD code keeps results <em>spread across lanes</em> for as long as
+  possible — accumulate vertically a thousand times, fold horizontally once at the very end.
+  When you see a weird data layout in a fast kernel, this is almost always why.</p>
+</section>
+
+<!-- ═══════════════ 05 PLATFORMS ═══════════════ -->
+<section id="c5">
+  <span class="eyebrow">05 · the two dialects</span>
+  <h2>Two worlds: x86 and ARM</h2>
+  <p class="lede">Every mainstream CPU has SIMD, but the two big instruction-set families evolved
+  it differently. x86 (Intel/AMD) kept <em>widening the register</em>. ARM (Apple, AWS, phones)
+  kept the register at 128 bits and instead added <em>smarter instructions</em> and more parallel
+  execution pipes.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>family</th><th>extension</th><th>year</th><th>width</th><th>the headline</th></tr></thead>
+      <tbody>
+        <tr class="x86"><td><span class="pill">x86</span></td><td class="mono">SSE / SSE2</td><td class="mono">1999</td><td class="mono">128-bit</td><td>SIMD goes mainstream; <code>xmm</code> registers</td></tr>
+        <tr class="x86"><td><span class="pill">x86</span></td><td class="mono">AVX / AVX2</td><td class="mono">2011 / 2013</td><td class="mono">256-bit</td><td>double width; AVX2 adds full integer ops (<code>ymm</code>)</td></tr>
+        <tr class="x86"><td><span class="pill">x86</span></td><td class="mono">AVX-512 (+VNNI)</td><td class="mono">2017 / 2019</td><td class="mono">512-bit</td><td>huge width + built-in masking + int8 dot products — but only on some chips</td></tr>
+        <tr class="arm"><td><span class="pill">ARM</span></td><td class="mono">NEON</td><td class="mono">~2009</td><td class="mono">128-bit</td><td>ARM's standard SIMD; mandatory on every 64-bit ARM core</td></tr>
+        <tr class="arm"><td><span class="pill">ARM</span></td><td class="mono">+dotprod</td><td class="mono">2017</td><td class="mono">128-bit</td><td><code>sdot</code>/<code>udot</code>: int8 dot products in one instruction</td></tr>
+        <tr class="arm"><td><span class="pill">ARM</span></td><td class="mono">+i8mm</td><td class="mono">2020</td><td class="mono">128-bit</td><td><code>smmla</code>: tiny int8 matrix multiplies</td></tr>
+        <tr class="arm"><td><span class="pill">ARM</span></td><td class="mono">SVE / SVE2</td><td class="mono">2016+</td><td class="mono">128–2048</td><td>width-agnostic vectors (servers/HPC; your laptop doesn't have it)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>So is a 512-bit x86 chip 4× faster than a 128-bit Apple chip?</strong> No — and this
+  is the most common beginner miscalibration. An Apple M4 has <em>four</em> 128-bit SIMD pipes
+  running every cycle, so its throughput per cycle rivals one 512-bit unit, with none of the
+  downclocking older AVX-512 chips suffered. Width is one axis; <em>pipes × width × what each
+  instruction does</em> is the real budget.</p>
+
+  <h3>Reading the mnemonics</h3>
+  <p class="dim" style="font-size:15px">Instruction names look like cat-on-keyboard but are strict
+  little sentences. The same operation, both dialects:</p>
+  <div class="mnemo" aria-label="x86 mnemonic anatomy">
+    <span class="mn-part pa">vp<small>vector · packed ints</small></span>
+    <span class="mn-part pr">dp<small>dot product</small></span>
+    <span class="mn-part pb">b<small>of bytes (8-bit)</small></span>
+    <span class="mn-part pa">u·s<small>unsigned × signed</small></span>
+    <span class="mn-part pr">d<small>accumulate to 32-bit</small></span>
+  </div>
+  <p class="dim mono" style="font-size:13px">= <code>vpdpbusd</code> (x86 AVX-512 VNNI)</p>
+  <div class="mnemo" aria-label="ARM mnemonic anatomy">
+    <span class="mn-part pa">s<small>signed</small></span>
+    <span class="mn-part pr">dot<small>dot product</small></span>
+    <span class="mn-part pb">.4s<small>into 4 × 32-bit lanes</small></span>
+    <span class="mn-part pa">.16b<small>from 16 × 8-bit lanes</small></span>
+  </div>
+  <p class="dim mono" style="font-size:13px">= <code>sdot v0.4s, v1.16b, v2.16b</code> (ARM NEON)</p>
+</section>
+
+<!-- ═══════════════ 06 DOT PRODUCTS ═══════════════ -->
+<section id="c6">
+  <span class="eyebrow">06 · the modern superstars</span>
+  <h2>Dot-product instructions</h2>
+  <p class="lede">Multiply pairs of numbers and add them up — the dot product — is the inner loop
+  of neural networks, embeddings, and similarity search. It matters so much that both families
+  added single instructions that do <em>multiply + add + accumulate</em> across many int8 lanes at
+  once. Here is ARM's <code>sdot</code>, live:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">sdot — 16 int8 pairs → 4 int32 sums, one instruction</span>
+      <div class="controls">
+        <button class="primary" id="sdotStep">process next group</button>
+        <button id="sdotAll">all at once (what the CPU does)</button>
+        <button id="sdotReset">reset</button>
+      </div>
+    </div>
+    <div class="strip-row"><span class="strip-label">A (16 × int8)</span><div class="strip" id="sdotA"></div></div>
+    <div class="strip-row"><span class="strip-label">B (16 × int8)</span><div class="strip" id="sdotB"></div></div>
+    <div class="sdot-groups" id="sdotGroups"></div>
+    <p class="note" id="sdotNote">Each output lane is the dot product of one 4-element group:
+    <code>acc[g] += A[4g]·B[4g] + … + A[4g+3]·B[4g+3]</code>. That's <b>16 multiplies and 16 adds —
+    32 arithmetic ops — in one instruction</b>, and it <em>accumulates</em>, so chaining them sums
+    a whole vector.</p>
+  </div>
+
+  <div class="isa-cards">
+    <div class="isa-card arm-c"><span class="tag">ARM · dotprod</span>
+      <h4>sdot / udot</h4>
+      <p>16 int8 products → 4 int32 accumulators. The workhorse on Apple Silicon and AWS
+      Graviton. 32 ops/instruction.</p></div>
+    <div class="isa-card x86-c"><span class="tag">x86 · AVX-512 VNNI</span>
+      <h4>vpdpbusd</h4>
+      <p>The same idea at 512-bit width: 64 int8 products → 16 int32 accumulators.
+      128 ops/instruction — when the CPU has it, which many don't.</p></div>
+    <div class="isa-card x86-c"><span class="tag">x86 · plain AVX2</span>
+      <h4>psadbw <span class="dim">(the improvised one)</span></h4>
+      <p>No dot product on plain AVX2 — but "sum of absolute differences vs zero" <em>is</em> a
+      sum of bytes. With a clever encoding (chapter 09) it impersonates a dot product on any
+      x86 made since ~2013.</p></div>
+    <div class="isa-card arm-c"><span class="tag">ARM · i8mm</span>
+      <h4>smmla</h4>
+      <p>A 2×8 × 8×2 int8 <em>matrix</em> multiply: 32 products/instruction — double
+      <code>sdot</code> on paper. Whether that wins in practice is a chapter-09 plot twist.</p></div>
+  </div>
+</section>
+
+<!-- ═══════════════ 07 THREE DOORS ═══════════════ -->
+<section id="c7">
+  <span class="eyebrow">07 · how code becomes SIMD</span>
+  <h2>Three ways in</h2>
+  <p class="lede">You almost never write raw machine code. There are three doors, in escalating
+  order of effort and control — real code from a real kernel behind each one:</p>
+
+  <div class="code-cols">
+    <div class="codebox">
+      <div class="cap">door 1 — the autovectorizer (free)</div>
+      <pre><span class="cm">// Write branch-free code and the compiler
+// emits SIMD for you. The trick: turn
+// `if (bit) sum += q[i]` into a mask:</span>
+<span class="kw">let</span> mask = -((byte &gt;&gt; j) &amp; <span class="lit">1</span>);  <span class="cm">// 0 or -1</span>
+p += q[i] &amp; mask;               <span class="cm">// no branch!</span>
+<span class="cm">// Same math, but now it's straight-line
+// arithmetic LLVM can vectorize.</span></pre>
+    </div>
+    <div class="codebox">
+      <div class="cap">door 2 — intrinsics (the usual)</div>
+      <pre><span class="cm">// C/Rust functions that map 1:1 to
+// instructions. You pick the ops; the
+// compiler still allocates registers.</span>
+<span class="kw">let</span> s = <span class="fn">_mm256_sad_epu8</span>(
+    <span class="fn">_mm256_and_si256</span>(mask, qbytes),
+    zero);
+<span class="cm">// ^ one AVX2 instruction each</span></pre>
+    </div>
+    <div class="codebox">
+      <div class="cap">door 3 — inline asm (last resort)</div>
+      <pre><span class="cm">// When the intrinsic doesn't exist yet
+// (Rust's sdot was nightly-only):</span>
+<span class="fn">asm!</span>(<span class="lit">"sdot {out:v}.4s,
+       {a:v}.16b, {b:v}.16b"</span>, …);
+<span class="cm">// Total control, zero safety net —
+// YOU must check the CPU supports it.</span></pre>
+    </div>
+  </div>
+
+  <p>Honest expectations, measured on the kernel in chapter 09: the autovectorizer bought
+  <strong>~2×</strong> over naive scalar. Hand-written intrinsics bought <strong>~40×</strong>.
+  The compiler is good at easy patterns and hopeless at exotic ones — it will never invent a
+  data layout or discover that <code>psadbw</code> can fake a dot product. Layout is the human's job.</p>
+</section>
+
+<!-- ═══════════════ 08 DISPATCH & TRAPS ═══════════════ -->
+<section id="c8">
+  <span class="eyebrow">08 · shipping it without crashing</span>
+  <h2>Dispatch &amp; the traps</h2>
+  <p class="lede">Here's the problem: you compile <em>one</em> binary, but your users' CPUs have
+  <em>different</em> instruction sets. Run an AVX-512 instruction on a chip without it and the
+  program doesn't get slower or wronger — it <strong>dies instantly</strong> (SIGILL: illegal
+  instruction). So real libraries check the CPU <em>at runtime</em> and pick a kernel. Try it:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">runtime dispatch simulator</span>
+      <div class="controls">
+        <label class="dim mono" style="font-size:13px" for="cpuSel">run on:</label>
+        <select id="cpuSel"></select>
+      </div>
+    </div>
+    <div class="feat-chips" id="cpuFeats"></div>
+    <div class="disp-rows" id="dispRows"></div>
+    <div class="controls" style="margin-top:16px">
+      <button class="danger" id="forceBtn">☠ skip the checks — force AVX-512 VNNI anyway</button>
+    </div>
+    <div class="crash" id="crashBox" role="alert"></div>
+    <p class="note" id="dispNote"></p>
+  </div>
+
+  <h3>Field notes: three ways this bites in real life</h3>
+  <div class="trap"><h4>The benchmark that lied (dead-code elimination)</h4>
+    <p>A kernel was benchmarked, its result thrown away — so the compiler <em>deleted the entire
+    loop</em> and reported a fake 43× speedup. The fix is <code>black_box()</code> (Rust) or
+    equivalent, forcing the result to be "used". Rule: a number that looks too good is a number
+    to disassemble.</p></div>
+  <div class="trap"><h4>The wrong-architecture binary (Rosetta)</h4>
+    <p>An Apple-Silicon Mac with an x86 toolchain installed will happily build x86 binaries and
+    <em>emulate</em> them — ~7× slower, and every ARM kernel silently skipped. The tell: the
+    disassembly contained zero <code>sdot</code> instructions. Always verify what you're actually
+    running, not what you think you built.</p></div>
+  <div class="trap"><h4>Compile-time flags ≠ runtime reality</h4>
+    <p>Building with <code>-C target-cpu=native</code> makes a binary that's fast on <em>your</em>
+    machine and a SIGILL grenade on anyone else's. Shipped code detects features at runtime —
+    that's exactly what the simulator above models.</p></div>
+</section>
+
+<!-- ═══════════════ 09 CASE STUDY ═══════════════ -->
+<section id="c9">
+  <span class="eyebrow">09 · everything at once, for real</span>
+  <h2>Case study: one kernel, five rungs</h2>
+  <p class="lede">From <a href="https://github.com/joe32140/nano-plaid">nano-plaid</a>, a search
+  engine that stores documents as <em>1-bit</em> vectors (just the signs — 25× smaller). Scoring
+  needs a dot product between an int8 query and those bits. The identity that makes it possible,
+  then the ladder of implementations — every chapter of this page appears in it:</p>
+
+  <div class="widget" style="background:var(--panel-2)">
+    <div class="widget-title" style="margin-bottom:10px">the algebraic key</div>
+    <p class="mono" style="font-size:15.5px;color:var(--ch-r)">q · signs&nbsp;=&nbsp;2P − T
+      <span class="dim" style="font-size:13px">&nbsp;&nbsp;where P = Σ q over 1-bits, T = Σ q (precomputed)</span></p>
+    <p class="note">Signs are ±1, so split the sum by bit value and the whole dot product
+    collapses to "sum the query values where the document has a 1-bit" — a <b>masked sum</b>.
+    Chapter 03's masks + chapter 06's dot instructions can do exactly that, without ever
+    decompressing the document.</p>
+  </div>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">measured: µs per document (lower = better)</span>
+      <div class="controls">
+        <div class="seg" role="group" aria-label="machine" id="segBench">
+          <button data-m="m4" aria-pressed="true">Apple M4</button>
+          <button data-m="x86" aria-pressed="false">x86 CI (AVX2)</button>
+          <button data-m="m1" aria-pressed="false">ARM CI (M1)</button>
+        </div>
+      </div>
+    </div>
+    <div class="bench" id="benchChart"></div>
+    <div class="bench-note" id="benchNote"></div>
+  </div>
+
+  <p>Read the ladder bottom-up and every lesson clicks into place:</p>
+  <p><strong>Rung 2 is the shocker</strong> — the clever algebra made it <em>slower</em> than the
+  float loop (a branch per bit is poison). <strong>Rung 3</strong>, the branchless mask rewrite,
+  let the autovectorizer help a little. <strong>Rung 4</strong> is the real jump — <code>sdot</code>
+  on ARM, the <code>psadbw</code> impersonation on x86, plus the deciding human insight: expand
+  each document's bits <em>once</em> in registers and reuse them across all 32 query rows (the
+  horizontal-tax lesson wearing work clothes). <strong>Rung 5</strong> is the humility check:
+  <code>smmla</code> does 2× the math per instruction and ties anyway, because the M4 issues it at
+  half the rate. Paper MACs lose to measured microarchitecture.</p>
+  <p class="dim">End to end: that kernel took real search over 5,183 scientific documents from
+  18 ms to <strong>5.7 ms per query</strong> — 3.3× faster than exhaustive float search, using
+  22× less memory.</p>
+</section>
+
+<!-- ═══════════════ 10 QUIZ ═══════════════ -->
+<section id="c10">
+  <span class="eyebrow">10 · check yourself</span>
+  <h2>Six questions</h2>
+  <p class="lede">Instant feedback, explanations included. Miss one? The chapter number is next
+  to it.</p>
+  <div id="quiz"></div>
+  <div class="score" id="scoreLine"></div>
+</section>
+
+<footer>
+  <p>Built as a companion to <a href="https://github.com/joe32140/nano-plaid">nano-plaid</a> —
+  late-interaction retrieval in one numpy file, with the Rust kernel ladder these numbers come
+  from. All benchmark figures measured (Apple M4 native; GitHub CI runners for x86/ARM Linux —
+  shared VMs, so treat their absolute times as indicative and the <em>ratios</em> as the signal).</p>
+</footer>
+<a class="next-class" href="class2.html"><span class="k">next → class 02</span>
+<span class="t">The 1-bit × int8 kernel: one identity, three platforms</span></a>
+</main>
+
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const mk=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;};
+const reduced=matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ── hero: SIMD letters light up as one "instruction" ─────────────── */
+(function(){
+  const reg=$("heroReg");
+  "SIMD".split("").forEach((ch,i)=>{
+    const c=mk("div","hero-cell");
+    c.append(mk("span","idx","lane "+i));
+    c.append(mk("span","big",ch));
+    reg.append(c);
+  });
+  const cells=[...reg.children];
+  let on=false;
+  function pulse(){
+    on=!on;
+    cells.forEach(c=>c.classList.toggle("lit",on));
+  }
+  if(reduced){cells.forEach(c=>c.classList.add("lit"));}
+  else{setTimeout(pulse,600);setInterval(pulse,2600);}
+})();
+
+/* ── 01 race ──────────────────────────────────────────────────────── */
+(function(){
+  const N=32,W=8,vals=Array.from({length:N},(_,i)=>(i%9)+1);
+  let sPos=0,vPos=0,timer=null,done=false;
+  function build(el,cl){el.innerHTML="";vals.forEach(v=>{const c=mk("div","rc",v);el.append(c);});}
+  function reset(){
+    clearInterval(timer);timer=null;sPos=0;vPos=0;done=false;
+    build($("scalarCells"));build($("simdCells"));
+    $("scalarCount").textContent="0";$("simdCount").textContent="0";
+    $("raceWinner").textContent="";$("raceRun").disabled=false;$("raceStep").disabled=false;
+  }
+  function tick(){
+    const sc=$("scalarCells").children,vc=$("simdCells").children;
+    if(sPos<N){
+      const c=sc[sPos];c.textContent=vals[sPos]*2;c.classList.add("done-a","flash");
+      setTimeout(()=>c.classList.remove("flash"),200);
+      sPos++;$("scalarCount").textContent=sPos;
+    }
+    if(vPos<N){
+      for(let k=0;k<W&&vPos+k<N;k++){
+        const c=vc[vPos+k];c.textContent=vals[vPos+k]*2;c.classList.add("done-b","flash");
+        setTimeout(()=>c.classList.remove("flash"),200);
+      }
+      vPos+=W;$("simdCount").textContent=Math.ceil(vPos/W);
+    }
+    if(vPos>=N&&!done){
+      done=true;
+      $("raceWinner").textContent="→ SIMD finished in "+Math.ceil(N/W)+" instructions. Scalar needs "+N+". Same result, "+(N/Math.ceil(N/W))+"× fewer instructions.";
+    }
+    if(sPos>=N){clearInterval(timer);timer=null;$("raceRun").disabled=false;}
+  }
+  $("raceRun").addEventListener("click",()=>{
+    if(timer)return; if(sPos>=N)reset();
+    $("raceRun").disabled=true;
+    timer=setInterval(tick,reduced?60:210);
+  });
+  $("raceStep").addEventListener("click",()=>{if(!timer)tick();});
+  $("raceReset").addEventListener("click",reset);
+  reset();
+})();
+
+/* ── 02 lane explorer ─────────────────────────────────────────────── */
+(function(){
+  let width=128,bits=8,tname="int8";
+  const regName=w=>w===128?"NEON “v0” · SSE “xmm0”":w===256?"AVX2 “ymm0”":"AVX-512 “zmm0”";
+  function render(){
+    const lanes=width/bits;
+    $("expSummary").innerHTML="<b>"+lanes+"</b> lanes of "+tname;
+    const strip=$("expStrip");strip.innerHTML="";
+    const px=Math.max(20,Math.min(84,760/lanes-3));
+    for(let i=0;i<lanes;i++){
+      const l=mk("div","exp-lane",lanes<=16?tname.replace("int","i").replace("float","f"):"");
+      l.style.width=px+"px";strip.append(l);
+    }
+    $("expMeta").textContent=regName(width)+" — "+width+" bits ÷ "+bits+" bits/element = "+lanes+" elements per instruction";
+  }
+  function wire(segId,fn){
+    const seg=$(segId);
+    seg.addEventListener("click",e=>{
+      const b=e.target.closest("button");if(!b)return;
+      [...seg.children].forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));
+      fn(b);render();
+    });
+  }
+  wire("segWidth",b=>{width=+b.dataset.w;});
+  wire("segType",b=>{bits=+b.dataset.b;tname=b.dataset.t;});
+  render();
+})();
+
+/* ── 03 lane ops ──────────────────────────────────────────────────── */
+(function(){
+  const A=[3,-1,7,2,9,-4,5,0],B=[2,5,1,8,-3,6,2,7];
+  const ops={
+    add:{sym:"A + B",f:(a,b)=>a+b,note:'Lane-wise add: each result lane is <code>A[i] + B[i]</code>. One instruction, eight independent adds.'},
+    mul:{sym:"A × B",f:(a,b)=>a*b,note:'Lane-wise multiply. On real hardware int multiplies widen (8-bit × 8-bit → 16-bit) so results don’t overflow — one reason lane sizes matter.'},
+    max:{sym:"max(A,B)",f:(a,b)=>Math.max(a,b),note:'Per-lane max — this is how MaxSim search keeps a running "best score so far" for many candidates at once, no branches.'},
+    cmpgt:{sym:"A > B ?",f:(a,b)=>a>b?"FFFF":"0000",note:'<b>Compare produces a mask</b>, not a boolean: all-ones where true, all-zeros where false. <code>data AND mask</code> keeps or kills each lane — branchless "if".'}
+  };
+  let op="add";
+  function strip(el,arr,cls){el.innerHTML="";arr.forEach(v=>{el.append(mk("div","lane "+cls,v));});}
+  function reset(){
+    strip($("opA"),A,"a");strip($("opB"),B,"b");
+    strip($("opR"),A.map(()=>"·"),"r ghost");
+    $("opSym").textContent=ops[op].sym;
+    $("opNote").innerHTML=ops[op].note;
+  }
+  $("segOp").addEventListener("click",e=>{
+    const b=e.target.closest("button");if(!b)return;
+    [...$("segOp").children].forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));
+    op=b.dataset.op;reset();
+  });
+  $("opRun").addEventListener("click",()=>{
+    reset();
+    const rl=[...$("opR").children];
+    rl.forEach((cell,i)=>{
+      const delay=reduced?0:i*90;
+      setTimeout(()=>{
+        cell.classList.remove("ghost");cell.classList.add("hot");
+        cell.textContent=ops[op].f(A[i],B[i]);
+        setTimeout(()=>cell.classList.remove("hot"),400);
+      },delay);
+    });
+  });
+  reset();
+})();
+
+/* ── 04 reduction tree ────────────────────────────────────────────── */
+(function(){
+  const init=[4,1,7,2,9,3,5,6];
+  let cur;
+  function draw(){
+    const area=$("treeArea");
+    const row=mk("div","tree-round");
+    row.append(mk("span","strip-label",cur.length===8?"start":cur.length+" lanes"));
+    const s=mk("div","strip");
+    cur.forEach(v=>s.append(mk("div","lane r"+(cur.length===1?" hot":""),v)));
+    row.append(s);
+    area.append(row);
+  }
+  function reset(){cur=init.slice();$("treeArea").innerHTML="";draw();
+    $("treeStep").disabled=false;
+    $("treeNote").textContent="Each round adds neighbors: 8 → 4 → 2 → 1. Three instructions just to fold one register — while a single lane-wise add would have processed 8 fresh numbers in the same time.";}
+  $("treeStep").addEventListener("click",()=>{
+    if(cur.length===1)return;
+    const nx=[];for(let i=0;i<cur.length;i+=2)nx.push(cur[i]+cur[i+1]);
+    cur=nx;draw();
+    if(cur.length===1){$("treeStep").disabled=true;
+      $("treeNote").textContent="Folded: 3 shuffle+add rounds for one register. Moral — accumulate vertically for as long as you can; pay this tax exactly once, at the end.";}
+  });
+  $("treeReset").addEventListener("click",reset);
+  reset();
+})();
+
+/* ── 06 sdot demo ─────────────────────────────────────────────────── */
+(function(){
+  const A=[2,1,3,1,-1,2,0,4,1,-2,2,3,5,0,1,2];
+  const B=[1,2,1,3, 2,1,3,1,3, 2,-1,2,1,4,2,1];
+  let g=0;
+  function strip(el,arr,cls){el.innerHTML="";arr.forEach((v,i)=>{
+    const l=mk("div","lane "+cls,v);l.dataset.i=i;el.append(l);});}
+  function buildGroups(){
+    const box=$("sdotGroups");box.innerHTML="";
+    for(let k=0;k<4;k++){
+      const gd=mk("div","sdot-g");gd.id="sg"+k;
+      const pair=mk("div","pair");
+      for(let j=0;j<4;j++){
+        const i=k*4+j;
+        const sp=mk("span",null,"");
+        sp.innerHTML='<span class="va">'+A[i]+'</span>·<span class="vb">'+B[i]+'</span>'+(j<3?" +":"");
+        pair.append(sp);
+      }
+      gd.append(pair);
+      gd.append(mk("div","sdot-acc","acc["+k+"] = ?"));
+      box.append(gd);
+    }
+  }
+  function fire(k,instant){
+    const gd=$("sg"+k);gd.classList.add("hot");
+    let sum=0;for(let j=0;j<4;j++)sum+=A[k*4+j]*B[k*4+j];
+    [...$("sdotA").children].forEach((l,i)=>l.classList.toggle("hot",(i>>2)===k));
+    [...$("sdotB").children].forEach((l,i)=>l.classList.toggle("hot",(i>>2)===k));
+    const acc=gd.querySelector(".sdot-acc");
+    acc.textContent="acc["+k+"] = "+sum;acc.classList.add("set");
+    if(!instant)setTimeout(()=>gd.classList.remove("hot"),700);
+  }
+  function reset(){
+    g=0;strip($("sdotA"),A,"a");strip($("sdotB"),B,"b");buildGroups();
+    $("sdotNote").innerHTML='Each output lane is the dot product of one 4-element group: <code>acc[g] += A[4g]·B[4g] + … + A[4g+3]·B[4g+3]</code>. That’s <b>16 multiplies and 16 adds — 32 arithmetic ops — in one instruction</b>, and it <em>accumulates</em>, so chaining them sums a whole vector.';
+  }
+  $("sdotStep").addEventListener("click",()=>{
+    if(g>3)return;fire(g,false);g++;
+    if(g>3)$("sdotNote").innerHTML="All 4 accumulators filled. <b>The CPU does not step</b> — all four groups happen simultaneously, in ~1 cycle. You just watched one instruction in slow motion.";
+  });
+  $("sdotAll").addEventListener("click",()=>{reset();for(let k=0;k<4;k++)fire(k,true);g=4;
+    $("sdotNote").innerHTML="<b>That's the real speed:</b> all 32 ops at once. The step button was the slow-motion replay.";});
+  $("sdotReset").addEventListener("click",reset);
+  reset();
+})();
+
+/* ── 08 dispatch simulator ────────────────────────────────────────── */
+(function(){
+  const CPUS=[
+    {name:"Apple M4 (MacBook)",arch:"arm64",feats:["neon","dotprod","i8mm"],
+     note:"Every Apple-Silicon Mac since M1 has dotprod, so the NEON sdot kernel dispatches. (M2+ add i8mm/smmla.)"},
+    {name:"GitHub CI runner (x86 Xeon)",arch:"x86_64",feats:["sse2","avx","avx2"],
+     note:"Typical cloud x86: AVX2 yes, AVX-512 no. The masked-SAD kernel is exactly for this tier — it's why it exists."},
+    {name:"Intel Cascade Lake server",arch:"x86_64",feats:["sse2","avx","avx2","avx512vnni"],
+     note:"Server silicon with VNNI: the 512-bit dot-product kernel wins here — 128 ops per instruction."},
+    {name:"2010 laptop (Core 2 Duo)",arch:"x86_64",feats:["sse2"],
+     note:"Pre-AVX. Every fused kernel is skipped; the branchless autovectorized fallback still runs correctly — just slower."},
+    {name:"Raspberry Pi 3 (ARMv8.0)",arch:"arm64",feats:["neon"],
+     note:"64-bit ARM but before the dotprod extension (2017). NEON exists, sdot doesn't — forcing it would SIGILL."},
+    {name:"Rosetta 2 (x86 binary on M4)",arch:"x86_64 (translated)",feats:["sse2","sse4.2"],
+     note:"The silent trap: a real M4 pretending to be an old x86. No AVX2 under emulation → fallback path, ~7× slower — on hardware that has a perfectly good sdot sitting unused."}
+  ];
+  const KERNELS=[
+    {label:"AVX-512 VNNI kernel",req:"needs x86_64 + avx512vnni",test:c=>c.arch.startsWith("x86")&&c.feats.includes("avx512vnni")},
+    {label:"AVX2 masked-SAD kernel",req:"needs x86_64 + avx2",test:c=>c.arch.startsWith("x86")&&c.feats.includes("avx2")},
+    {label:"NEON sdot kernel",req:"needs arm64 + dotprod",test:c=>c.arch==="arm64"&&c.feats.includes("dotprod")},
+    {label:"autovectorized fallback",req:"always available",test:()=>true}
+  ];
+  const ALLFEATS=["sse2","sse4.2","avx","avx2","avx512vnni","neon","dotprod","i8mm"];
+  const sel=$("cpuSel");
+  CPUS.forEach((c,i)=>{const o=document.createElement("option");o.value=i;o.textContent=c.name;sel.append(o);});
+  function render(){
+    const cpu=CPUS[sel.value];
+    const chips=$("cpuFeats");chips.innerHTML="";
+    ALLFEATS.forEach(f=>{
+      const rel=(cpu.arch==="arm64")?["neon","dotprod","i8mm"].includes(f):["sse2","sse4.2","avx","avx2","avx512vnni"].includes(f);
+      if(!rel)return;
+      chips.append(mk("span","chip"+(cpu.feats.includes(f)?" on":""),f+(cpu.feats.includes(f)?" ✓":" ✗")));
+    });
+    const archChip=mk("span","chip on",cpu.arch);chips.prepend(archChip);
+    const rows=$("dispRows");rows.innerHTML="";
+    let picked=false;
+    KERNELS.forEach((k,i)=>{
+      const r=mk("div","disp-row");
+      const req=mk("div","req");req.innerHTML="<b>"+(i+1)+". "+k.label+"</b><small>"+k.req+"</small>";
+      const v=mk("div","verdict");
+      const ok=k.test(cpu);
+      if(picked){r.classList.add("skipped");v.textContent="not reached";}
+      else if(ok){r.classList.add("pass");v.textContent="✓ DISPATCHES";picked=true;}
+      else{r.classList.add("fail");v.textContent="✗ check fails";}
+      r.append(req,v);rows.append(r);
+    });
+    $("crashBox").classList.remove("show");
+    $("dispNote").innerHTML="<b>"+cpu.name+":</b> "+cpu.note;
+  }
+  $("forceBtn").addEventListener("click",()=>{
+    const cpu=CPUS[sel.value];
+    const box=$("crashBox");
+    if(cpu.arch.startsWith("x86")&&cpu.feats.includes("avx512vnni")){
+      box.innerHTML="<b>ok —</b> this CPU actually has VNNI, so it runs. But you got lucky: same binary on the CI runner would be the line below.";
+    }else{
+      box.innerHTML="<b>SIGILL</b> — illegal instruction (core dumped)<br><span class='dim'>The CPU met an opcode it doesn't decode. Not slower. Not wrong. Dead — instantly. This is why the checks above run first, every time.</span>";
+    }
+    box.classList.remove("show");void box.offsetWidth;box.classList.add("show");
+  });
+  sel.addEventListener("change",render);
+  render();
+})();
+
+/* ── 09 bench chart ───────────────────────────────────────────────── */
+(function(){
+  const DATA={
+    m4:{note:"Apple M4, native arm64 — quiet machine, trustworthy absolutes. 32-token query × 2000 docs × 80 tokens, dim 128.",
+      rows:[["rung 1 · float reference",72.6],["rung 2 · identity, branchy",174.5],
+            ["rung 3 · branchless autovec",82.3],["rung 4 · NEON sdot fused",1.89,true],
+            ["rung 5 · smmla (ties!)",1.90]]},
+    x86:{note:"GitHub CI x86 runner (shared VM — read the ratios, not the microseconds). AVX2 masked-SAD is the fused kernel here: ~28× over the fallback.",
+      rows:[["rung 1 · float reference",219.3],["rung 2 · identity, branchy",358.4],
+            ["rung 3 · branchless autovec",207.0],["rung 4 · AVX2 masked-SAD",7.38,true]]},
+    m1:{note:"GitHub CI macOS runner (M1, shared VM). dotprod yes, i8mm no — so rung 5 doesn't exist on this core. sdot: ~68× over the float loop.",
+      rows:[["rung 1 · float reference",179.1],["rung 2 · identity, branchy",312.1],
+            ["rung 3 · branchless autovec",189.6],["rung 4 · NEON sdot fused",2.63,true]]}
+  };
+  const MAXV=360;
+  function render(key){
+    const d=DATA[key],box=$("benchChart");box.innerHTML="";
+    d.rows.forEach(([lbl,v,win])=>{
+      const row=mk("div","bench-row"+(win?" win":""));
+      row.append(mk("div","lbl",lbl));
+      const tr=mk("div","track");const bar=mk("div","bar");
+      bar.style.width="0%";tr.append(bar);row.append(tr);
+      const speed=(d.rows[0][1]/v);
+      const val=mk("div","val");
+      val.innerHTML=v.toFixed(v<10?2:1)+" µs <small>· "+(speed>=1?speed.toFixed(speed>=10?0:1)+"×":("0."+Math.round(speed*100)+"×").replace("0.0","0."))+"</small>";
+      row.append(val);box.append(row);
+      requestAnimationFrame(()=>{requestAnimationFrame(()=>{
+        bar.style.width=Math.max(1.2,(v/MAXV)*100)+"%";});});
+    });
+    $("benchNote").textContent=d.note;
+  }
+  $("segBench").addEventListener("click",e=>{
+    const b=e.target.closest("button");if(!b)return;
+    [...$("segBench").children].forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));
+    render(b.dataset.m);
+  });
+  render("m4");
+})();
+
+/* ── 10 quiz ──────────────────────────────────────────────────────── */
+(function(){
+  const QS=[
+    {q:"A 256-bit register holds 32-bit floats. How many lanes?",ch:"02",
+     opts:["4","8","16","32"],right:1,
+     why:"256 ÷ 32 = 8. Lane count is always register width divided by element width — which is why shrinking elements (float32 → int8) multiplies throughput."},
+    {q:"Which is the expensive operation in SIMD?",ch:"04",
+     opts:["Adding two registers lane-by-lane","Summing all lanes of one register into a single number","Comparing two registers","Loading a register from memory"],right:1,
+     why:"Horizontal reductions cost log₂(lanes) shuffle+add rounds. Vertical (lane-wise) ops are one instruction. Fast kernels accumulate vertically and fold once at the end."},
+    {q:"You run an AVX-512 instruction on a CPU without AVX-512. What happens?",ch:"08",
+     opts:["It runs slower","It computes wrong results","The program crashes instantly (SIGILL)","The OS emulates it"],right:2,
+     why:"The CPU can't decode the opcode at all — it raises an illegal-instruction fault and the process dies. That's why libraries check features at runtime before dispatching."},
+    {q:"A benchmark reports a suspiciously huge 43× speedup. The most likely culprit?",ch:"08",
+     opts:["The kernel is just that good","The compiler deleted the benchmarked loop because its result was unused","Turbo boost","The CPU cached the answer"],right:1,
+     why:"Dead-code elimination. If nothing uses the result, the optimizer removes the work, and you time an empty loop. black_box()-style sinks force the work to be real."},
+    {q:"ARM's smmla does 2× the multiply-adds of sdot per instruction. On the Apple M4 it… ",ch:"09",
+     opts:["runs 2× faster","runs about the same","runs 2× slower","crashes"],right:1,
+     why:"Measured: a tie (1.90 vs 1.89 µs/doc). The M4 issues smmla at about half sdot's rate, so double work × half rate = even. Paper op-counts don't beat the microarchitecture — benchmark."},
+    {q:"AVX-512 registers are 4× wider than NEON's 128-bit. Is an AVX-512 chip therefore 4× faster at SIMD?",ch:"05",
+     opts:["Yes, width is throughput","No — throughput is width × pipes × per-instruction work","Only for floats","Only in benchmarks"],right:1,
+     why:"An M4 runs four 128-bit pipes per cycle, matching one 512-bit unit — and its dot-product instructions do more per bit. Width is one factor of several."}
+  ];
+  let answered=0,correct=0;
+  const box=$("quiz");
+  QS.forEach((Q,qi)=>{
+    const card=mk("div","q");
+    const head=mk("div","qq");head.innerHTML=(qi+1)+". "+Q.q+' <span class="dim mono" style="font-size:12px">· ch '+Q.ch+"</span>";
+    card.append(head);
+    const opts=mk("div","opts");
+    const why=mk("div","why");why.textContent=Q.why;
+    Q.opts.forEach((o,oi)=>{
+      const b=mk("button","opt",o);
+      b.addEventListener("click",()=>{
+        if(card.dataset.done)return;card.dataset.done="1";answered++;
+        if(oi===Q.right){b.classList.add("right");correct++;}
+        else{b.classList.add("wrong");opts.children[Q.right].classList.add("right");}
+        why.classList.add("show");
+        $("scoreLine").textContent="score: "+correct+" / "+answered+(answered===QS.length?(correct===QS.length?" — perfect. Go read a disassembly for fun.":" — re-visit the chapter numbers you missed."):"");
+      });
+      opts.append(b);
+    });
+    card.append(opts,why);box.append(card);
+  });
+})();
+})();
+</script>
+
+</body>
+</html>
