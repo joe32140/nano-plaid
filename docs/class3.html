@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Class 03 · the 1-bit × int8 kernel — nano-plaid SIMD school</title>
+<link rel="stylesheet" href="course.css">
+<style>
+  /* ── class-2 specific components ── */
+  .q2row{display:flex;gap:12px;align-items:flex-start;margin:10px 0;flex-wrap:wrap}
+  .q2cell{min-width:64px;padding:7px 4px;background:var(--panel-2);border:1px solid var(--line);
+    border-radius:7px;text-align:center;font-family:var(--mono);font-variant-numeric:tabular-nums;
+    transition:border-color .25s,background .25s}
+  .q2cell .top{font-size:12.5px;color:var(--muted)}
+  .q2cell .bot{font-size:15px;margin-top:3px}
+  .q2cell.qa .bot{color:var(--ch-a)} .q2cell.qb .bot{color:var(--ch-b)}
+  .kv{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px;font-family:var(--mono);
+      font-size:14px;font-variant-numeric:tabular-nums}
+  .kv .k{color:var(--faint)} .kv b{font-size:17px}
+  .kv .pv b{color:var(--ok)} .kv .tv b{color:var(--ch-a)} .kv .sv b{color:var(--ch-r)}
+
+  /* identity playground */
+  .bitlane{cursor:pointer;user-select:none}
+  .bitlane:focus-visible{outline:2px solid var(--ch-b);outline-offset:2px}
+  .bitlane.on{border-color:#2f5e3c;background:#12241a;color:var(--ok)}
+  .bitlane.off{border-color:var(--line);color:var(--faint)}
+  .id-readout{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:18px}
+  .id-box{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel-2)}
+  .id-box .lab{font-family:var(--mono);font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--faint)}
+  .id-box .val{font-family:var(--mono);font-size:24px;margin-top:4px;font-variant-numeric:tabular-nums}
+  .id-box.p .val{color:var(--ok)} .id-box.t .val{color:var(--ch-a)}
+  .id-box.s .val{color:var(--ch-r)} .id-box.d .val{color:var(--ch-b)}
+  .match{font-family:var(--mono);font-size:14px;margin-top:14px;color:var(--ok)}
+
+  /* SAD pipeline */
+  .sad-stage{margin:14px 0;opacity:.28;transition:opacity .4s}
+  .sad-stage.live{opacity:1}
+  .sad-stage .cap{font-family:var(--mono);font-size:12.5px;color:var(--faint);margin-bottom:6px}
+  .sad-stage .cap b{color:var(--ch-b)}
+  .sad-final{font-family:var(--mono);font-size:15px;border:1px dashed var(--line);
+    border-radius:10px;padding:12px 16px;margin-top:14px;color:var(--muted)}
+  .sad-final b{color:var(--ok);font-size:18px}
+
+  /* plane grid */
+  .pg-wrap{display:flex;gap:26px;flex-wrap:wrap;margin-top:8px}
+  .pgrid{border-collapse:collapse}
+  .pgrid th{font-size:10px;padding:4px 6px;border:0;background:none;color:var(--faint);
+    font-family:var(--mono);text-transform:none;letter-spacing:0}
+  .pgrid td{width:34px;height:34px;text-align:center;border:1px solid var(--line);
+    font-family:var(--mono);font-size:13px;padding:0;background:var(--panel-2);
+    transition:all .25s;color:var(--muted)}
+  .pgrid td.one{color:var(--ink)}
+  .pgrid td.hotcol{background:#14222e;border-color:var(--ch-b);color:var(--ch-b)}
+  .plane-out{flex:1;min-width:250px}
+  .plane-row{display:flex;gap:5px;align-items:center;margin:5px 0}
+  .plane-row .pl{font-family:var(--mono);font-size:11.5px;color:var(--faint);width:70px}
+  .plane-row .pb{width:34px;height:30px;border:1px solid var(--line);border-radius:5px;
+    display:flex;align-items:center;justify-content:center;font-family:var(--mono);
+    font-size:12.5px;background:var(--panel-2);color:var(--faint)}
+  .plane-row.fresh .pb{border-color:var(--ch-b);color:var(--ch-b)}
+  .ops-counter{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:12px}
+  .ops-counter b{color:var(--ch-b)}
+
+  /* strategy comparer */
+  .strat{display:grid;gap:10px;margin-top:16px}
+  .strat-row{display:grid;grid-template-columns:minmax(190px,240px) 1fr 120px;gap:12px;align-items:center}
+  .strat-row .lbl{font-family:var(--mono);font-size:12.5px;color:var(--muted);text-align:right}
+  .strat-row .lbl small{display:block;color:var(--faint);font-size:11px}
+  .strat-row .track{height:26px;background:#0b111c;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .strat-row .bar{height:100%;transition:width .45s cubic-bezier(.2,.8,.2,1);
+    background:linear-gradient(90deg,#31537a,var(--ch-b))}
+  .strat-row.bad .bar{background:linear-gradient(90deg,#6e2c40,var(--bad))}
+  .strat-row.win .bar{background:linear-gradient(90deg,#2f5e3c,var(--ok))}
+  .strat-row .val{font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums}
+  .sliderline{display:flex;gap:14px;align-items:center;font-family:var(--mono);font-size:13.5px}
+  input[type=range]{accent-color:var(--ch-b);width:min(320px,60vw)}
+  input[type=range]:focus-visible{outline:2px solid var(--ch-b);outline-offset:4px}
+
+  .plat-badges{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 16px}
+  .plat-badge{font-family:var(--mono);font-size:12px;padding:4px 12px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
+  .plat-badge.armb{border-color:#2c5a6e;color:var(--ch-b)}
+  .plat-badge.x86b{border-color:#7a5a2c;color:var(--ch-a)}
+</style>
+</head>
+<body>
+<div class="course-bar">
+  <span class="brand">nano-plaid · SIMD school</span>
+  <nav class="tabs" aria-label="Classes">
+    <a href="./" class="tab">Class 01 · SIMD from zero</a>
+    <a href="class2.html" class="tab">Class 02 · MaxSim via GEMM</a>
+    <a href="class3.html" class="tab active">Class 03 · the 1-bit × int8 kernel</a>
+    <a href="https://github.com/joe32140/nano-plaid" class="tab">repo ↗</a>
+  </nav>
+</div>
+
+<main>
+<header>
+  <span class="eyebrow">class 03 · builds on classes 01–02 — <b>masks, lanes, dot instructions, the GEMM bar</b></span>
+  <h1>Score a document you never decompress.</h1>
+  <p class="hero-sub">nano-plaid stores every document token as <b>1 bit per dimension</b> —
+  25× smaller than float32. This class is the complete story of how those bits get scored
+  against an int8 query at full speed: one line of algebra, then the same kernel materialized
+  three different ways on three different CPUs. Every number below is the same worked example,
+  carried from chapter to chapter.</p>
+
+  <nav class="toc" aria-label="Chapters">
+    <span class="eyebrow">chapters</span>
+    <ol>
+      <li><a href="#k1"><span class="n">01</span> The setup: 512 B → 20 B</a></li>
+      <li><a href="#k2"><span class="n">02</span> Two quantizers</a></li>
+      <li><a href="#k3"><span class="n">03</span> The identity: 2P − T</a></li>
+      <li><a href="#k4"><span class="n">04</span> ARM: NEON sdot</a></li>
+      <li><a href="#k5"><span class="n">05</span> x86: the psadbw heist</a></li>
+      <li><a href="#k6"><span class="n">06</span> x86 deluxe: AVX-512 VNNI</a></li>
+      <li><a href="#k7"><span class="n">07</span> The fusion: loop order wins</a></li>
+      <li><a href="#k7b"><span class="n">08</span> The other family: popcount</a></li>
+      <li><a href="#k8"><span class="n">09</span> Scoreboard</a></li>
+      <li><a href="#k9"><span class="n">10</span> Check yourself</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ═══ 01 SETUP ═══ -->
+<section id="k1">
+  <span class="eyebrow">01 · why bother</span>
+  <h2>The setup: 512 bytes → 20 bytes</h2>
+  <p class="lede">Late-interaction search (ColBERT-style) stores <em>hundreds of vectors per
+  document</em>. At dim 128 in float32 that's 512 bytes per token — the index dwarfs the text
+  it indexes. nano-plaid's binary scheme keeps only the <strong>sign</strong> of each dimension:</p>
+  <div class="widget" style="background:var(--panel-2)">
+    <div class="strip-row"><span class="strip-label">float32 token</span>
+      <div class="strip"><div class="lane a" style="min-width:76px">0.113</div><div class="lane a" style="min-width:76px">−0.067</div><div class="lane a" style="min-width:76px">0.031</div><div class="lane a ghost" style="min-width:76px">… ×128</div></div></div>
+    <div class="strip-row"><span class="strip-label">stored bits</span>
+      <div class="strip"><div class="lane r">1</div><div class="lane r">0</div><div class="lane r">1</div><div class="lane r ghost">… ×128 = 16 bytes</div></div></div>
+    <p class="note">Whether ranking survives this depends on the embedding model — the repo's
+    <a href="https://github.com/joe32140/nano-plaid">measured answer</a> is 97–99% of exact
+    NDCG for a good dim-128 checkpoint. This class is about the other half of the bargain:
+    <b>scoring those bits fast</b>. The obvious way — decompress to ±1 floats and hand the matmul
+    to <a href="class2.html">class 02's GEMM machine</a> — throws the compression win away at
+    query time. We won't do the obvious way.</p>
+  </div>
+  <p>The shape of the problem, for the rest of the class: <strong>one query</strong> of ~32
+  tokens, each an int8 row of 128 values, against <strong>thousands of candidate documents</strong>,
+  each ~80 tokens of 128 <em>bits</em>. Per (query token, doc token) pair we need a dot product;
+  per query token we keep the max; sum of maxes is the document's score (MaxSim).</p>
+</section>
+
+<!-- ═══ 02 QUANTIZERS ═══ -->
+<section id="k2">
+  <span class="eyebrow">02 · the two encodings</span>
+  <h2>Two quantizers, deliberately unequal</h2>
+  <p class="lede">The <em>document</em> gets brutal 1-bit treatment because there are millions of
+  document tokens. The <em>query</em> is tiny (32 rows) and scored thousands of times, so it can
+  afford 8 bits — this asymmetry is the design. Randomize the inputs and watch both encoders:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">quantizer — 8 of 128 dims shown</span>
+      <div class="controls"><button class="primary" id="reQuant">↻ randomize</button></div>
+    </div>
+    <h3 style="margin-top:0">query token → int8 (keeps magnitude)</h3>
+    <div class="q2row" id="qFloatRow"></div>
+    <div class="kv" id="qMeta"></div>
+    <h3>document token → sign bits (keeps direction only)</h3>
+    <div class="q2row" id="dFloatRow"></div>
+    <p class="note"><b>Two numbers get precomputed at quantize time</b> and ride along with the
+    query for free: the scale (to undo the ×127 later) and <b>T = Σ of the int8 codes</b> per row.
+    Remember T — it's about to matter a lot.</p>
+  </div>
+</section>
+
+<!-- ═══ 03 IDENTITY ═══ -->
+<section id="k3">
+  <span class="eyebrow">03 · the one line of algebra</span>
+  <h2>The identity: q · signs = 2P − T</h2>
+  <p class="lede">Signs are ±1. Split the dot product into lanes where the bit is 1 (contribute
+  <code>+q</code>) and lanes where it's 0 (contribute <code>−q</code>):</p>
+  <p class="mono" style="font-size:16px;color:var(--ch-r);margin:10px 0 4px">
+    q·s&nbsp;=&nbsp;P&nbsp;−&nbsp;(T&nbsp;−&nbsp;P)&nbsp;=&nbsp;<b>2P&nbsp;−&nbsp;T</b></p>
+  <p class="dim mono" style="font-size:13px">P = Σ q over 1-bits&nbsp;&nbsp;·&nbsp;&nbsp;T = Σ q (already precomputed)</p>
+  <p style="margin-top:14px">So the whole dot product collapses to <strong>one masked sum</strong>:
+  add up the query values where the document has a 1. No decompression, no multiplies, no ±1
+  anywhere. Toggle the document's bits and watch the identity refuse to break:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">identity playground — click the bits</span>
+      <div class="controls"><button id="idReset">reset bits</button></div></div>
+    <div class="strip-row"><span class="strip-label">query int8</span><div class="strip" id="idQ"></div></div>
+    <div class="strip-row"><span class="strip-label">doc bits <span class="dim">(click!)</span></span><div class="strip" id="idBits"></div></div>
+    <div class="id-readout">
+      <div class="id-box p"><div class="lab">P — Σq over 1-bits</div><div class="val" id="idP"></div></div>
+      <div class="id-box t"><div class="lab">T — Σq (precomputed)</div><div class="val" id="idT"></div></div>
+      <div class="id-box s"><div class="lab">2P − T</div><div class="val" id="idS"></div></div>
+      <div class="id-box d"><div class="lab">q · (±1) directly</div><div class="val" id="idD"></div></div>
+    </div>
+    <div class="match" id="idMatch"></div>
+    <p class="note">This is <b>exact</b> — integer equals integer, not an approximation. The only
+    approximation in the whole scheme happened back when the document kept only its signs.
+    Now the engineering question: each platform needs its fastest way to compute a
+    <b>bit-masked sum of int8s</b>. Three answers follow.</p>
+  </div>
+</section>
+
+<!-- ═══ 04 NEON ═══ -->
+<section id="k4">
+  <span class="eyebrow">04 · platform I</span>
+  <h2>ARM: expand to 0/1, then <code>sdot</code></h2>
+  <div class="plat-badges"><span class="plat-badge armb">Apple M-series</span>
+    <span class="plat-badge armb">AWS Graviton</span><span class="plat-badge armb">needs: dotprod (2017+)</span></div>
+  <p class="lede">Class 01 showed <code>sdot</code>: 16 int8 products accumulated per instruction.
+  Feed it the query on one side and the document's bits expanded to <b>0/1 bytes</b> on the other,
+  and <code>sdot(q, bits)</code> computes… exactly P. The identity does the rest. The only real
+  work is unpacking 128 bits into 128 bytes — and NEON does it 16 bytes at a time:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">bit-plane extraction — 4 packed bytes shown (real kernel: 16 at once)</span>
+      <div class="controls">
+        <button class="primary" id="planeStep">extract next plane</button>
+        <button id="planeReset">reset</button>
+      </div>
+    </div>
+    <div class="pg-wrap">
+      <div>
+        <table class="pgrid" id="pgrid" aria-label="packed bits as a byte-by-bit grid"></table>
+        <div class="ops-counter" id="planeOps">0 planes extracted · 0 instructions</div>
+      </div>
+      <div class="plane-out" id="planeOut"><p class="dim" style="font-size:13.5px">Each “plane” is
+        one bit position sliced across <em>all</em> bytes at once: a single
+        <code>shift + AND</code> on the whole register. Press the button.</p></div>
+    </div>
+    <p class="note"><b>8 planes × 2 ops = 128 bits → 128 bytes in ~17 instructions</b>, entirely
+    inside registers. Then 8 <code>sdot</code>s cover all 128 dims against one query row. One
+    subtlety: the planes come out in a shuffled dim order — so the <em>query</em> is pre-shuffled
+    into the same order once at quantize time, where it costs nothing.</p>
+  </div>
+</section>
+
+<!-- ═══ 05 AVX2 SAD ═══ -->
+<section id="k5">
+  <span class="eyebrow">05 · platform II</span>
+  <h2>x86: the <code>psadbw</code> heist</h2>
+  <div class="plat-badges"><span class="plat-badge x86b">any x86 since ~2013</span>
+    <span class="plat-badge x86b">needs: AVX2 only</span></div>
+  <p class="lede">Plain AVX2 has <em>no</em> int8 dot-product instruction — that's an AVX-512
+  luxury. What it does have is <code>psadbw</code>: <em>sum of absolute differences</em> of
+  unsigned bytes, built for video motion-search in the 1990s. Watch it get repurposed,
+  stage by stage, on the same numbers as chapter 03:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">the five-stage heist</span>
+      <div class="controls">
+        <button class="primary" id="sadStep">next stage</button>
+        <button id="sadReset">restart</button>
+      </div>
+    </div>
+    <div id="sadStages"></div>
+    <div class="sad-final" id="sadFinal" style="visibility:hidden"></div>
+    <p class="note" id="sadNote">Problem to solve: <code>psadbw</code> only eats <b>unsigned</b>
+    bytes, but query values are signed (−128…127).</p>
+  </div>
+
+  <p>Why this is beautiful: <code>AND</code>, <code>psadbw</code>, and <code>paddq</code> are all
+  ancient, 1-µop, run-anywhere instructions. No AVX-512 required, no new silicon — just the
+  observation that <em>a masked sum is a sum</em>, plus one bias trick to survive the
+  unsigned-only diet. This is the kernel that GitHub's stock CI runners execute, measured at
+  <strong>~28× over the autovectorized fallback</strong>.</p>
+</section>
+
+<!-- ═══ 06 VNNI ═══ -->
+<section id="k6">
+  <span class="eyebrow">06 · platform III</span>
+  <h2>x86 deluxe: AVX-512 VNNI</h2>
+  <div class="plat-badges"><span class="plat-badge x86b">server Xeons, Zen 4+</span>
+    <span class="plat-badge x86b">needs: avx512vnni (2019+)</span></div>
+  <p class="lede">Where it exists, <code>vpdpbusd</code> is <code>sdot</code>'s x86 twin at 4× the
+  width: <strong>64 int8 products → 16 int32 accumulators, per instruction</strong>. A 128-dim
+  token is 128 expanded bytes = two 512-bit registers — so one (query row × doc token) dot
+  product is just <em>two instructions</em>:</p>
+  <div class="code-cols">
+    <div class="codebox"><div class="cap">the whole inner product, VNNI</div>
+      <pre>acc = <span class="fn">_mm512_dpbusd_epi32</span>(acc, bits01_lo, q_lo);
+acc = <span class="fn">_mm512_dpbusd_epi32</span>(acc, bits01_hi, q_hi);
+<span class="cm">// P is now spread across 16 lanes —
+// horizontal-fold once at the end (class 01, ch 04)</span></pre></div>
+    <div class="codebox"><div class="cap">one quirk worth knowing</div>
+      <pre><span class="cm">// vpdpbusd is Unsigned × Signed:
+//   first operand  = u8  → the 0/1 bits ✓
+//   second operand = i8  → the query    ✓
+// Swap them and negative query values
+// silently corrupt the sum. The 'bus'
+// in the mnemonic is load-bearing.</span></pre></div>
+  </div>
+  <p>Same skeleton as NEON: expand bits to 0/1 bytes (here with a broadcast + byte-shuffle +
+  mask-test dance instead of shift+AND), <code>dpbusd</code> for P, <code>2P−T</code>, done.
+  nano-plaid ships NEON and AVX2 and leaves VNNI as the guided exercise — it's the least
+  universal of the three — but the production twin
+  (<a href="https://github.com/lightonai/next-plaid">next-plaid</a>) implements all of them,
+  and its dispatcher tries VNNI first when the CPU offers it.</p>
+</section>
+
+<!-- ═══ 07 FUSION ═══ -->
+<section id="k7">
+  <span class="eyebrow">07 · the part instructions can't fix</span>
+  <h2>The fusion: loop order wins</h2>
+  <p class="lede">All three platforms share a hidden cost: expanding a doc token's bits to bytes
+  (~17 ops) is <em>more expensive than the dot product itself</em> (~8 ops). So <em>when</em> you
+  expand — the loop order — matters more than any instruction choice. Drag the query size:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">cost per doc token, three strategies</span></div>
+    <div class="sliderline">
+      <label for="nqSlider">query tokens:</label>
+      <input type="range" id="nqSlider" min="1" max="32" value="32">
+      <b id="nqVal" style="color:var(--ch-b)">32</b>
+    </div>
+    <div class="strat" id="stratRows"></div>
+    <p class="note" id="stratNote"></p>
+  </div>
+
+  <p>Strategy B looks like the obvious fix — precompute the expansion into the index and skip it
+  at query time! It <strong>loses in practice</strong>: stored planes are 128 bytes per token
+  instead of 16, so every candidate drags 8× the data through the memory system. Measured on the
+  M4: no faster than fused, at 8× the index size. <strong>Strategy C — expand once per doc token
+  into registers, score it against all 32 query rows before moving on — is the fused kernel</strong>,
+  and it's the same "keep work vertical, pay overhead once" instinct as class 01's horizontal-tax
+  chapter, applied to a loop instead of a register.</p>
+</section>
+
+<!-- ═══ 08 THE OTHER FAMILY ═══ -->
+<section id="k7b">
+  <span class="eyebrow">08 · prior art — the road we didn't take</span>
+  <h2>The other family: AND + popcount</h2>
+  <p class="lede">Masked sums are not the only way to score bits — and honesty requires the
+  comparison. There's a second, better-traveled family, used by Elastic's
+  <a href="https://www.elastic.co/search-labs/blog/bbq-vector-comparison-simd-instructions">BBQ</a>
+  inside Lucene/Elasticsearch and by a decade of binary neural networks before it
+  (<a href="https://arxiv.org/abs/1603.05279">XNOR-Net</a> onward): don't keep the query as int8
+  at all. Slice the <em>query</em> into bit-planes too, and every plane-product runs straight
+  on the packed bits:</p>
+  <p class="mono" style="font-size:15.5px;color:var(--ch-r);margin:12px 0 4px">
+    q&nbsp;=&nbsp;Σᵢ&nbsp;2ⁱ·planeᵢ&nbsp;&nbsp;⇒&nbsp;&nbsp;P&nbsp;=&nbsp;Σᵢ&nbsp;2ⁱ&nbsp;·&nbsp;popcount(planeᵢ&nbsp;AND&nbsp;bits)</p>
+  <p class="dim mono" style="font-size:13px">one AND + one popcount per query bit — no doc
+  expansion, no bias heist, then the same 2P − T</p>
+  <p style="margin-top:14px">The costs just move: family A pays <strong>per query bit</strong>
+  (int4 query = 4 passes, int8 = 8 — BBQ picks int4 for exactly this reason), while our family B
+  pays a <strong>doc-side expansion</strong> that fusion amortizes across query rows. So the
+  winner depends on one number you already met in chapter 07 — drag it:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">ops per (query row × doc token) — approximate, NEON-flavored</span></div>
+    <div class="sliderline">
+      <label for="famSlider">query tokens sharing each doc token:</label>
+      <input type="range" id="famSlider" min="1" max="32" value="1">
+      <b id="famVal" style="color:var(--ch-b)">1</b>
+    </div>
+    <div class="strat" id="famRows"></div>
+    <p class="note" id="famNote"></p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th></th><th>family A — AND + popcount</th><th>family B — masked sum (this class)</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">document storage</td><td>1 bit/dim, packed — <b>identical</b></td><td>1 bit/dim, packed — <b>identical</b></td></tr>
+        <tr><td class="mono">query precision</td><td>compute grows per bit → int4 typical</td><td>int8 at flat cost</td></tr>
+        <tr><td class="mono">doc-side expansion</td><td>none — reads packed bits directly</td><td>once per doc token, amortized by fusion</td></tr>
+        <tr><td class="mono">hardware sweet spot</td><td>popcount-rich: NEON <code>CNT</code>, AVX-512 <code>VPOPCNTDQ</code></td><td>dot/SAD-rich: <code>sdot</code>, <code>psadbw</code>, VNNI</td></tr>
+        <tr><td class="mono">natural habitat</td><td>single-vector dense search (nq = 1): BBQ</td><td>late interaction (nq ≈ 32): MaxSim</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Neither is "the" answer — each team built the right kernel for its workload's
+  shape. Prior art worth reading: <a href="https://www.elastic.co/search-labs/blog/bbq-vector-comparison-simd-instructions">BBQ's
+  SIMD writeup</a> (they explicitly chose popcount over <code>psadbw</code> for their layout),
+  the <a href="https://dl.acm.org/doi/10.1145/3608447">bit-serial dot-product literature</a>,
+  and <a href="https://github.com/WojciechMula/sse-popcount">Muła's popcount collection</a> —
+  where the psadbw-as-byte-sum idiom itself comes from. The masked-sum lineage here follows
+  mixedbread's binary MaxSim kernels via
+  <a href="https://github.com/lightonai/next-plaid">next-plaid</a>.</p>
+</section>
+
+<!-- ═══ 09 SCOREBOARD ═══ -->
+<section id="k8">
+  <span class="eyebrow">09 · did it work</span>
+  <h2>Scoreboard</h2>
+  <p class="lede">Same kernel contract — bit-identical scores to the scalar reference — measured
+  per platform. Bars are µs per document (32-token query × 80-token doc, dim 128):</p>
+
+  <div class="widget">
+    <div class="bench" id="finalBench"></div>
+    <div class="bench-note">M4 measured natively (trustworthy absolutes). CI rows are GitHub's
+    shared runners — read the <em>ratios</em>. VNNI has no row: no such hardware in this
+    project's CI; it's implemented and dispatched in next-plaid.</div>
+  </div>
+
+  <div class="widget" style="background:var(--panel-2)">
+    <div class="widget-title" style="margin-bottom:12px">and end-to-end, on a real corpus</div>
+    <p>SciFact, 5,183 documents (1.19M token vectors), 300 real queries, whole two-stage search
+    per query:</p>
+    <div class="kv" style="margin-top:12px">
+      <span><span class="k">exhaustive float32 —</span> <b>19 ms</b> <span class="k">· 610 MB index</span></span>
+      <span><span class="k">binary + numpy —</span> <b>18 ms</b> <span class="k">· 28 MB</span></span>
+      <span><span class="k">binary + this kernel —</span> <b class="sv" style="color:var(--ok)">5.7 ms</b> <span class="k">· 28 MB · 97.8% of exact NDCG</span></span>
+    </div>
+    <p class="note">22× less memory <em>and</em> 3.3× faster than exhaustive search — the
+    compressed representation stopped being a trade-off. That's what one algebraic identity plus
+    three well-chosen instructions buy.</p>
+  </div>
+</section>
+
+<!-- ═══ 10 QUIZ ═══ -->
+<section id="k9">
+  <span class="eyebrow">10 · check yourself</span>
+  <h2>Six questions</h2>
+  <div id="quiz2"></div>
+  <div class="score" id="scoreLine2"></div>
+</section>
+
+<a class="next-class" href="class2.html"><span class="k">← back to class 02</span>
+<span class="t">MaxSim via GEMM: the float path this kernel has to beat</span></a>
+
+<footer>
+  <p>Class 03 of the <a href="https://github.com/joe32140/nano-plaid">nano-plaid</a> SIMD school.
+  The kernels live in <span class="mono">kernels/src/lib.rs</span> (NEON + AVX2, with tests
+  asserting bit-identical scores) — the AVX-512 VNNI production version is in
+  <a href="https://github.com/lightonai/next-plaid">next-plaid</a>. All numbers measured; CI
+  figures from shared runners are labeled as such.</p>
+</footer>
+</main>
+
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const mk=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
+const reduced=matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* the running example, shared across chapters */
+const Q=[12,-7,3,25,-14,6,-2,9];               // int8 query codes
+const T=Q.reduce((a,b)=>a+b,0);                // 32
+const BITS0=[1,0,1,1,0,1,0,1];                 // doc bits
+
+/* ── 02 quantizer ─────────────────────────────────────────────────── */
+(function(){
+  function rnd(){return Math.round((Math.random()*2-1)*200)/1000;}
+  function render(){
+    const qf=Array.from({length:8},rnd), df=Array.from({length:8},rnd);
+    const maxabs=Math.max(...qf.map(Math.abs),1e-9);
+    const scale=maxabs/127;
+    const codes=qf.map(v=>Math.max(-127,Math.min(127,Math.round(v/scale))));
+    const t=codes.reduce((a,b)=>a+b,0);
+    const qr=$("qFloatRow");qr.innerHTML="";
+    qf.forEach((v,i)=>{const c=mk("div","q2cell qa");
+      c.append(mk("div","top",v.toFixed(3)));c.append(mk("div","bot",codes[i]));qr.append(c);});
+    $("qMeta").innerHTML='<span><span class="k">scale = max|q| ÷ 127 =</span> <b>'+scale.toFixed(5)+'</b></span>'+
+      '<span class="tv"><span class="k">T = Σ codes =</span> <b>'+t+'</b></span>';
+    const dr=$("dFloatRow");dr.innerHTML="";
+    df.forEach(v=>{const c=mk("div","q2cell qb");
+      c.append(mk("div","top",v.toFixed(3)));c.append(mk("div","bot",v>0?"1":"0"));dr.append(c);});
+  }
+  $("reQuant").addEventListener("click",render);
+  render();
+})();
+
+/* ── 03 identity playground ───────────────────────────────────────── */
+(function(){
+  let bits=BITS0.slice();
+  const qs=$("idQ");
+  Q.forEach(v=>qs.append(mk("div","lane a",v)));
+  const bs=$("idBits");
+  function drawBits(){
+    bs.innerHTML="";
+    bits.forEach((b,i)=>{
+      const l=mk("button","lane bitlane "+(b?"on":"off"),b);
+      l.setAttribute("aria-label","toggle bit "+i);
+      l.addEventListener("click",()=>{bits[i]^=1;drawBits();calc();});
+      bs.append(l);
+    });
+  }
+  function calc(){
+    const P=Q.reduce((a,q,i)=>a+(bits[i]?q:0),0);
+    const s2=2*P-T;
+    const direct=Q.reduce((a,q,i)=>a+q*(bits[i]?1:-1),0);
+    $("idP").textContent=P;$("idT").textContent=T;
+    $("idS").textContent=s2;$("idD").textContent=direct;
+    $("idMatch").textContent=(s2===direct)?"✓ identical — every time, exactly":"✗ (impossible)";
+    [...qs.children].forEach((l,i)=>l.style.opacity=bits[i]?1:.35);
+  }
+  $("idReset").addEventListener("click",()=>{bits=BITS0.slice();drawBits();calc();});
+  drawBits();calc();
+})();
+
+/* ── 05 SAD heist ─────────────────────────────────────────────────── */
+(function(){
+  const bits=BITS0.slice();
+  const QB=Q.map(v=>v+128);
+  const masked=QB.map((v,i)=>bits[i]?v:0);
+  const SAD=masked.reduce((a,b)=>a+b,0);
+  const CNT=bits.reduce((a,b)=>a+b,0);
+  const P=SAD-128*CNT, SCORE=2*P-T;
+  function strip(vals,cls,fmt){
+    const s=mk("div","strip");
+    vals.forEach(v=>s.append(mk("div","lane "+cls,fmt?fmt(v):v)));
+    return s;
+  }
+  const stages=[
+    {cap:"stage 0 — the signed query (psadbw can't eat this: it's unsigned-only)",
+     el:()=>strip(Q,"a")},
+    {cap:"stage 1 — <b>bias every value by +128</b>: qb = q + 128, now a legal unsigned byte",
+     el:()=>strip(QB,"a")},
+    {cap:"stage 2 — build the mask from the doc's bits (compare → FF/00, class 01 ch 03)",
+     el:()=>strip(bits.map(b=>b?"FF":"00"),"b")},
+    {cap:"stage 3 — <b>qb AND mask</b>: survivors are exactly the 1-bit lanes",
+     el:()=>strip(masked,"r")},
+    {cap:"stage 4 — <b>psadbw vs zero</b> = sum of survivors, one instruction",
+     el:()=>{const s=strip([SAD],"r");s.firstChild.style.minWidth="80px";return s;}},
+    {cap:"stage 5 — un-bias: every 1-bit lane smuggled in an extra +128, so subtract 128 × popcount("+CNT+" bits)",
+     el:()=>{const s=strip(["P = "+SAD+" − 128×"+CNT+" = "+P],"r");s.firstChild.style.minWidth="220px";return s;}}
+  ];
+  let st=0;
+  function reset(){
+    st=0;const box=$("sadStages");box.innerHTML="";
+    stages.forEach(g=>{
+      const d=mk("div","sad-stage");
+      const cap=mk("div","cap");cap.innerHTML=g.cap;
+      d.append(cap,g.el());box.append(d);
+    });
+    box.children[0].classList.add("live");st=1;
+    $("sadFinal").style.visibility="hidden";
+    $("sadNote").innerHTML="Problem to solve: <code>psadbw</code> only eats <b>unsigned</b> bytes, but query values are signed (−128…127).";
+  }
+  $("sadStep").addEventListener("click",()=>{
+    const box=$("sadStages");
+    if(st<stages.length){box.children[st].classList.add("live");st++;}
+    if(st===stages.length){
+      const f=$("sadFinal");f.style.visibility="visible";
+      f.innerHTML="P = "+P+" &nbsp;→&nbsp; score = 2P − T = 2×"+P+" − "+T+" = <b>"+SCORE+"</b> — same answer as chapter 03, using a 1996 video instruction.";
+      $("sadNote").innerHTML="Every stage was a cheap 1-µop AVX2 instruction (<code>AND</code>, <code>psadbw</code>, adds). The bias rides along arithmetically and is settled once per lane-count — <b>that's the whole heist</b>.";
+    }
+  });
+  $("sadReset").addEventListener("click",reset);
+  reset();
+})();
+
+/* ── 04 plane extraction ──────────────────────────────────────────── */
+(function(){
+  const BYTES=[0b10110101,0b01101100,0b11010010,0b00111001];
+  let p=0;
+  function buildGrid(){
+    const t=$("pgrid");t.innerHTML="";
+    const hr=mk("tr");hr.append(mk("th","", ""));
+    for(let b=0;b<8;b++)hr.append(mk("th","","bit "+(7-b)));
+    t.append(hr);
+    BYTES.forEach((by,r)=>{
+      const tr=mk("tr");tr.append(mk("th","","byte "+r));
+      for(let b=0;b<8;b++){
+        const bit=(by>>(7-b))&1;
+        const td=mk("td",bit?"one":"",bit);
+        td.dataset.col=b;tr.append(td);
+      }
+      t.append(tr);
+    });
+  }
+  function reset(){
+    p=0;buildGrid();
+    $("planeOut").innerHTML='<p class="dim" style="font-size:13.5px">Each “plane” is one bit position sliced across <em>all</em> bytes at once: a single <code>shift + AND</code> on the whole register. Press the button.</p>';
+    $("planeOps").textContent="0 planes extracted · 0 instructions";
+    $("planeStep").disabled=false;
+  }
+  $("planeStep").addEventListener("click",()=>{
+    if(p>7)return;
+    [...document.querySelectorAll("#pgrid td")].forEach(td=>
+      td.classList.toggle("hotcol",+td.dataset.col===p));
+    if(p===0)$("planeOut").innerHTML="";
+    const row=mk("div","plane-row fresh");
+    row.append(mk("span","pl","plane "+p+" →"));
+    BYTES.forEach(by=>row.append(mk("span","pb",(by>>(7-p))&1)));
+    row.append(mk("span","pl","  dims k·8+"+p));
+    [...$("planeOut").children].forEach(r=>r.classList.remove("fresh"));
+    $("planeOut").append(row);
+    p++;
+    $("planeOps").innerHTML=p+" planes · <b>"+(p*2)+" instructions</b> (1 shift + 1 AND each)";
+    if(p>7){$("planeStep").disabled=true;
+      $("planeOps").innerHTML="done: 8 planes · <b>16 instructions</b> — 32 bits became 32 bytes of 0/1, register-only. (The real kernel does 16 bytes per row: 128 bits → 128 bytes, same 16 instructions + stores.)";}
+  });
+  $("planeReset").addEventListener("click",reset);
+  reset();
+})();
+
+/* ── 07 strategy comparer ─────────────────────────────────────────── */
+(function(){
+  const EXPAND=17,DOT=8;
+  const box=$("stratRows");
+  const rows=[
+    {k:"A",lbl:"naïve: expand per pair",sub:"re-expand for every query row",cls:"bad",
+     f:n=>n*(EXPAND+DOT),mem:"16 B/token"},
+    {k:"B",lbl:"store planes in the index",sub:"no expansion at query time",cls:"",
+     f:n=>n*DOT,mem:"128 B/token ⚠ 8× memory traffic"},
+    {k:"C",lbl:"fused: expand once / doc token",sub:"the shipped kernel",cls:"win",
+     f:n=>EXPAND+n*DOT,mem:"16 B/token"}
+  ];
+  const els=rows.map(r=>{
+    const row=mk("div","strat-row "+r.cls);
+    const l=mk("div","lbl");l.innerHTML="<b>"+r.k+"</b> · "+r.lbl+"<small>"+r.sub+" · "+r.mem+"</small>";
+    const tr=mk("div","track");const bar=mk("div","bar");tr.append(bar);
+    const v=mk("div","val");
+    row.append(l,tr,v);box.append(row);
+    return {bar,v,f:r.f};
+  });
+  function render(){
+    const n=+$("nqSlider").value;$("nqVal").textContent=n;
+    const vals=els.map(e=>e.f(n)),max=Math.max(...vals);
+    els.forEach((e,i)=>{
+      e.bar.style.width=Math.max(2,vals[i]/max*100)+"%";
+      e.v.textContent=vals[i]+" ops";
+    });
+    const ratio=(vals[0]/vals[2]).toFixed(1);
+    $("stratNote").innerHTML="At <b>"+n+"</b> query token"+(n>1?"s":"")+", fusion does the same scoring in <b>"+ratio+"× fewer ops</b> than naïve — and B's op count is a mirage: it pays in memory bandwidth instead (measured: no faster, 8× bigger index). <b>Loop order and layout are the human's contribution; no compiler makes this move.</b>";
+  }
+  $("nqSlider").addEventListener("input",render);
+  render();
+})();
+
+/* ── 08 family crossover ──────────────────────────────────────────── */
+(function(){
+  const box=$("famRows");
+  const rows=[
+    {lbl:"family A · AND+popcount",sub:"int4 query · no expansion · ×2 for int8",cls:"",f:()=>13},
+    {lbl:"family B · masked sum",sub:"int8 query · fused expansion (ch 07)",cls:"win",f:n=>8+17/n}
+  ];
+  const els=rows.map(r=>{
+    const row=mk("div","strat-row "+r.cls);
+    const l=mk("div","lbl");l.innerHTML=r.lbl+"<small>"+r.sub+"</small>";
+    const tr=mk("div","track");const bar=mk("div","bar");tr.append(bar);
+    const v=mk("div","val");
+    row.append(l,tr,v);box.append(row);
+    return {row,bar,v,f:r.f};
+  });
+  function render(){
+    const n=+$("famSlider").value;$("famVal").textContent=n;
+    const vals=els.map(e=>e.f(n)),MAX=26;
+    els.forEach((e,i)=>{
+      e.bar.style.width=Math.max(3,vals[i]/MAX*100)+"%";
+      e.v.textContent="≈ "+vals[i].toFixed(1)+" ops";
+    });
+    const aWins=vals[0]<vals[1];
+    els[0].row.classList.toggle("win",aWins);
+    els[1].row.classList.toggle("win",!aWins);
+    if(n===1)$("famNote").innerHTML="<b>nq = 1 — BBQ's world.</b> One query vector per search means the doc expansion never amortizes (17 ops eaten whole), so popcount on packed bits wins ~2×. This is why Lucene's dense-retrieval kernel is family A.";
+    else if(aWins)$("famNote").innerHTML="Family A still ahead — the expansion isn't amortized enough yet.";
+    else $("famNote").innerHTML="<b>nq = "+n+" — MaxSim's world.</b> Expansion amortizes to "+(17/n).toFixed(1)+" ops/pair and family B pulls ahead — <em>while carrying int8 query precision</em>. Family A at int8 would need 8 passes (≈26 ops), ~3× worse. Each family is the right answer to a different workload shape.";
+  }
+  $("famSlider").addEventListener("input",render);
+  render();
+})();
+
+/* ── 09 scoreboard ────────────────────────────────────────────────── */
+(function(){
+  const ROWS=[
+    ["Apple M4 — autovec fallback",82.3,""],
+    ["Apple M4 — NEON sdot fused",1.89,"win"],
+    ["x86 CI — autovec fallback",207.0,""],
+    ["x86 CI — AVX2 psadbw fused",7.38,"win"],
+    ["ARM CI (M1) — sdot fused",2.63,"win"]
+  ];
+  const MAX=210,box=$("finalBench");
+  ROWS.forEach(([lbl,v,cls])=>{
+    const row=mk("div","bench-row "+cls);
+    row.append(mk("div","lbl",lbl));
+    const tr=mk("div","track"),bar=mk("div","bar");
+    bar.style.width="0%";tr.append(bar);row.append(tr);
+    const val=mk("div","val");val.innerHTML=v.toFixed(v<10?2:1)+" µs";
+    row.append(val);box.append(row);
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      bar.style.width=Math.max(1.4,v/MAX*100)+"%";}));
+  });
+})();
+
+/* ── 09 quiz ──────────────────────────────────────────────────────── */
+(function(){
+  const QS=[
+    {q:"q = [5, −3, 2] (so T = 4). Doc bits = 1,0,1. The score is…",ch:"03",
+     opts:["4","7","10","14"],right:2,
+     why:"P = 5 + 2 = 7, so 2P − T = 14 − 4 = 10. Check directly: signs are +,−,+ → 5 + 3 + 2 = 10. Exact, always."},
+    {q:"Why does the AVX2 kernel add +128 to every query value first?",ch:"05",
+     opts:["To avoid overflow","psadbw only accepts unsigned bytes; the bias is subtracted back via 128 × popcount","To double the score for precision","x86 stores integers biased"],right:1,
+     why:"Signed −128…127 becomes unsigned 0…255. Each surviving lane smuggles in exactly +128, and popcount says how many survived — so one subtraction settles the debt."},
+    {q:"The document is never decompressed to floats during scoring because…",ch:"03",
+     opts:["floats are inaccurate","the identity turns the dot product into a masked sum over the bits themselves","the CPU can't load floats that fast","documents are cached"],right:1,
+     why:"2P − T needs only 'sum of query values where the bit is 1' — computable straight from the packed bits with masks and integer adds."},
+    {q:"Expanding a doc token's bits costs ~17 ops; a dot product ~8. The fused kernel therefore…",ch:"07",
+     opts:["skips expansion","expands each doc token once and scores it against every query row before moving on","expands the query instead","uses fewer bits"],right:1,
+     why:"With 32 query rows, expansion amortizes to ~0.5 ops per score instead of 17. Loop order — not a fancier instruction — is where the win lives."},
+    {q:"Pre-expanding all bits into the index (no query-time expansion at all) was measured to be…",ch:"07",
+     opts:["2× faster","about the same speed, with 8× the index size — a pure loss","10× faster","impossible to build"],right:1,
+     why:"Stored planes are 128 B/token vs 16 B packed. The kernel becomes memory-bound: same speed, 8× the bytes. Op counts lie when bandwidth is the bottleneck."},
+    {q:"Lucene's BBQ scores the same int-query × 1-bit docs with AND + popcount bit-planes instead of masked sums. Why does that fit BBQ?",ch:"08",
+     opts:["popcount is always faster than psadbw","BBQ searches with a single query vector — no batch of query rows to amortize a doc expansion, and popcount reads the packed bits directly","Lucene can't emit AVX2","binary documents require popcount"],right:1,
+     why:"Family A pays per query bit but needs no doc expansion; family B pays expansion once and amortizes it across query rows. At nq = 1 (dense search) A is natural; at nq ≈ 32 (late interaction) B wins, with int8 precision to spare. Workload shape picks the kernel."}
+  ];
+  let answered=0,correct=0;
+  const box=$("quiz2");
+  QS.forEach((Qz,qi)=>{
+    const card=mk("div","q");
+    const head=mk("div","qq");head.innerHTML=(qi+1)+". "+Qz.q+' <span class="dim mono" style="font-size:12px">· ch '+Qz.ch+"</span>";
+    const opts=mk("div","opts");
+    const why=mk("div","why",Qz.why);
+    Qz.opts.forEach((o,oi)=>{
+      const b=mk("button","opt",o);
+      b.addEventListener("click",()=>{
+        if(card.dataset.done)return;card.dataset.done="1";answered++;
+        if(oi===Qz.right){b.classList.add("right");correct++;}
+        else{b.classList.add("wrong");opts.children[Qz.right].classList.add("right");}
+        why.classList.add("show");
+        $("scoreLine2").textContent="score: "+correct+" / "+answered+(answered===QS.length?(correct===QS.length?" — perfect. Go port the VNNI kernel.":" — the chapter numbers point the way back."):"");
+      });
+      opts.append(b);
+    });
+    card.append(head,opts,why);box.append(card);
+  });
+})();
+})();
+</script>
+</body>
+</html>
