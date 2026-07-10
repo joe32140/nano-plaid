@@ -113,8 +113,9 @@
       <li><a href="#k5"><span class="n">05</span> x86: the psadbw heist</a></li>
       <li><a href="#k6"><span class="n">06</span> x86 deluxe: AVX-512 VNNI</a></li>
       <li><a href="#k7"><span class="n">07</span> The fusion: loop order wins</a></li>
-      <li><a href="#k8"><span class="n">08</span> Scoreboard</a></li>
-      <li><a href="#k9"><span class="n">09</span> Check yourself</a></li>
+      <li><a href="#k7b"><span class="n">08</span> The other family: popcount</a></li>
+      <li><a href="#k8"><span class="n">09</span> Scoreboard</a></li>
+      <li><a href="#k9"><span class="n">10</span> Check yourself</a></li>
     </ol>
   </nav>
 </header>
@@ -326,9 +327,62 @@ acc = <span class="fn">_mm512_dpbusd_epi32</span>(acc, bits01_hi, q_hi);
   chapter, applied to a loop instead of a register.</p>
 </section>
 
-<!-- ═══ 08 SCOREBOARD ═══ -->
+<!-- ═══ 08 THE OTHER FAMILY ═══ -->
+<section id="k7b">
+  <span class="eyebrow">08 · prior art — the road we didn't take</span>
+  <h2>The other family: AND + popcount</h2>
+  <p class="lede">Masked sums are not the only way to score bits — and honesty requires the
+  comparison. There's a second, better-traveled family, used by Elastic's
+  <a href="https://www.elastic.co/search-labs/blog/bbq-vector-comparison-simd-instructions">BBQ</a>
+  inside Lucene/Elasticsearch and by a decade of binary neural networks before it
+  (<a href="https://arxiv.org/abs/1603.05279">XNOR-Net</a> onward): don't keep the query as int8
+  at all. Slice the <em>query</em> into bit-planes too, and every plane-product runs straight
+  on the packed bits:</p>
+  <p class="mono" style="font-size:15.5px;color:var(--ch-r);margin:12px 0 4px">
+    q&nbsp;=&nbsp;Σᵢ&nbsp;2ⁱ·planeᵢ&nbsp;&nbsp;⇒&nbsp;&nbsp;P&nbsp;=&nbsp;Σᵢ&nbsp;2ⁱ&nbsp;·&nbsp;popcount(planeᵢ&nbsp;AND&nbsp;bits)</p>
+  <p class="dim mono" style="font-size:13px">one AND + one popcount per query bit — no doc
+  expansion, no bias heist, then the same 2P − T</p>
+  <p style="margin-top:14px">The costs just move: family A pays <strong>per query bit</strong>
+  (int4 query = 4 passes, int8 = 8 — BBQ picks int4 for exactly this reason), while our family B
+  pays a <strong>doc-side expansion</strong> that fusion amortizes across query rows. So the
+  winner depends on one number you already met in chapter 07 — drag it:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">ops per (query row × doc token) — approximate, NEON-flavored</span></div>
+    <div class="sliderline">
+      <label for="famSlider">query tokens sharing each doc token:</label>
+      <input type="range" id="famSlider" min="1" max="32" value="1">
+      <b id="famVal" style="color:var(--ch-b)">1</b>
+    </div>
+    <div class="strat" id="famRows"></div>
+    <p class="note" id="famNote"></p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th></th><th>family A — AND + popcount</th><th>family B — masked sum (this class)</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">document storage</td><td>1 bit/dim, packed — <b>identical</b></td><td>1 bit/dim, packed — <b>identical</b></td></tr>
+        <tr><td class="mono">query precision</td><td>compute grows per bit → int4 typical</td><td>int8 at flat cost</td></tr>
+        <tr><td class="mono">doc-side expansion</td><td>none — reads packed bits directly</td><td>once per doc token, amortized by fusion</td></tr>
+        <tr><td class="mono">hardware sweet spot</td><td>popcount-rich: NEON <code>CNT</code>, AVX-512 <code>VPOPCNTDQ</code></td><td>dot/SAD-rich: <code>sdot</code>, <code>psadbw</code>, VNNI</td></tr>
+        <tr><td class="mono">natural habitat</td><td>single-vector dense search (nq = 1): BBQ</td><td>late interaction (nq ≈ 32): MaxSim</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Neither is "the" answer — each team built the right kernel for its workload's
+  shape. Prior art worth reading: <a href="https://www.elastic.co/search-labs/blog/bbq-vector-comparison-simd-instructions">BBQ's
+  SIMD writeup</a> (they explicitly chose popcount over <code>psadbw</code> for their layout),
+  the <a href="https://dl.acm.org/doi/10.1145/3608447">bit-serial dot-product literature</a>,
+  and <a href="https://github.com/WojciechMula/sse-popcount">Muła's popcount collection</a> —
+  where the psadbw-as-byte-sum idiom itself comes from. The masked-sum lineage here follows
+  mixedbread's binary MaxSim kernels via
+  <a href="https://github.com/lightonai/next-plaid">next-plaid</a>.</p>
+</section>
+
+<!-- ═══ 09 SCOREBOARD ═══ -->
 <section id="k8">
-  <span class="eyebrow">08 · did it work</span>
+  <span class="eyebrow">09 · did it work</span>
   <h2>Scoreboard</h2>
   <p class="lede">Same kernel contract — bit-identical scores to the scalar reference — measured
   per platform. Bars are µs per document (32-token query × 80-token doc, dim 128):</p>
@@ -355,10 +409,10 @@ acc = <span class="fn">_mm512_dpbusd_epi32</span>(acc, bits01_hi, q_hi);
   </div>
 </section>
 
-<!-- ═══ 09 QUIZ ═══ -->
+<!-- ═══ 10 QUIZ ═══ -->
 <section id="k9">
-  <span class="eyebrow">09 · check yourself</span>
-  <h2>Five questions</h2>
+  <span class="eyebrow">10 · check yourself</span>
+  <h2>Six questions</h2>
   <div id="quiz2"></div>
   <div class="score" id="scoreLine2"></div>
 </section>
@@ -568,7 +622,40 @@ const BITS0=[1,0,1,1,0,1,0,1];                 // doc bits
   render();
 })();
 
-/* ── 08 scoreboard ────────────────────────────────────────────────── */
+/* ── 08 family crossover ──────────────────────────────────────────── */
+(function(){
+  const box=$("famRows");
+  const rows=[
+    {lbl:"family A · AND+popcount",sub:"int4 query · no expansion · ×2 for int8",cls:"",f:()=>13},
+    {lbl:"family B · masked sum",sub:"int8 query · fused expansion (ch 07)",cls:"win",f:n=>8+17/n}
+  ];
+  const els=rows.map(r=>{
+    const row=mk("div","strat-row "+r.cls);
+    const l=mk("div","lbl");l.innerHTML=r.lbl+"<small>"+r.sub+"</small>";
+    const tr=mk("div","track");const bar=mk("div","bar");tr.append(bar);
+    const v=mk("div","val");
+    row.append(l,tr,v);box.append(row);
+    return {row,bar,v,f:r.f};
+  });
+  function render(){
+    const n=+$("famSlider").value;$("famVal").textContent=n;
+    const vals=els.map(e=>e.f(n)),MAX=26;
+    els.forEach((e,i)=>{
+      e.bar.style.width=Math.max(3,vals[i]/MAX*100)+"%";
+      e.v.textContent="≈ "+vals[i].toFixed(1)+" ops";
+    });
+    const aWins=vals[0]<vals[1];
+    els[0].row.classList.toggle("win",aWins);
+    els[1].row.classList.toggle("win",!aWins);
+    if(n===1)$("famNote").innerHTML="<b>nq = 1 — BBQ's world.</b> One query vector per search means the doc expansion never amortizes (17 ops eaten whole), so popcount on packed bits wins ~2×. This is why Lucene's dense-retrieval kernel is family A.";
+    else if(aWins)$("famNote").innerHTML="Family A still ahead — the expansion isn't amortized enough yet.";
+    else $("famNote").innerHTML="<b>nq = "+n+" — MaxSim's world.</b> Expansion amortizes to "+(17/n).toFixed(1)+" ops/pair and family B pulls ahead — <em>while carrying int8 query precision</em>. Family A at int8 would need 8 passes (≈26 ops), ~3× worse. Each family is the right answer to a different workload shape.";
+  }
+  $("famSlider").addEventListener("input",render);
+  render();
+})();
+
+/* ── 09 scoreboard ────────────────────────────────────────────────── */
 (function(){
   const ROWS=[
     ["Apple M4 — autovec fallback",82.3,""],
@@ -607,7 +694,10 @@ const BITS0=[1,0,1,1,0,1,0,1];                 // doc bits
      why:"With 32 query rows, expansion amortizes to ~0.5 ops per score instead of 17. Loop order — not a fancier instruction — is where the win lives."},
     {q:"Pre-expanding all bits into the index (no query-time expansion at all) was measured to be…",ch:"07",
      opts:["2× faster","about the same speed, with 8× the index size — a pure loss","10× faster","impossible to build"],right:1,
-     why:"Stored planes are 128 B/token vs 16 B packed. The kernel becomes memory-bound: same speed, 8× the bytes. Op counts lie when bandwidth is the bottleneck."}
+     why:"Stored planes are 128 B/token vs 16 B packed. The kernel becomes memory-bound: same speed, 8× the bytes. Op counts lie when bandwidth is the bottleneck."},
+    {q:"Lucene's BBQ scores the same int-query × 1-bit docs with AND + popcount bit-planes instead of masked sums. Why does that fit BBQ?",ch:"08",
+     opts:["popcount is always faster than psadbw","BBQ searches with a single query vector — no batch of query rows to amortize a doc expansion, and popcount reads the packed bits directly","Lucene can't emit AVX2","binary documents require popcount"],right:1,
+     why:"Family A pays per query bit but needs no doc expansion; family B pays expansion once and amortizes it across query rows. At nq = 1 (dense search) A is natural; at nq ≈ 32 (late interaction) B wins, with int8 precision to spare. Workload shape picks the kernel."}
   ];
   let answered=0,correct=0;
   const box=$("quiz2");
