@@ -9,6 +9,8 @@
 
 <p align="center">
   <a href="https://github.com/joe32140/nano-plaid/actions/workflows/ci.yml"><img src="https://github.com/joe32140/nano-plaid/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  &nbsp;
+  <a href="https://joe32140.github.io/nano-plaid/"><b>🎛️ SIMD school</b> — the interactive course (2 classes)</a>
 </p>
 
 # nano-plaid
