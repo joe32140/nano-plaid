@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Class 04 · the residual LUT kernel — nano-plaid SIMD school</title>
+<link rel="stylesheet" href="course.css">
+<style>
+  /* ── class-4 specific components ── */
+  .kv{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px;font-family:var(--mono);
+      font-size:14px;font-variant-numeric:tabular-nums}
+  .kv .k{color:var(--faint)} .kv b{font-size:17px}
+  .id-box{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel-2)}
+  .id-box .lab{font-family:var(--mono);font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--faint)}
+  .id-box .val{font-family:var(--mono);font-size:22px;margin-top:4px;font-variant-numeric:tabular-nums}
+  .id-readout{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:18px}
+  .id-box.c .val{color:var(--ch-a)} .id-box.r .val{color:var(--ch-b)}
+  .id-box.s .val{color:var(--ok)}
+  .sliderline{display:flex;gap:14px;align-items:center;font-family:var(--mono);font-size:13.5px;flex-wrap:wrap}
+  input[type=range]{accent-color:var(--ch-b);width:min(320px,60vw)}
+  input[type=range]:focus-visible{outline:2px solid var(--ch-b);outline-offset:4px}
+
+  /* LUT strip + lookup animation */
+  .lut-strip{display:flex;gap:3px;flex-wrap:wrap;margin:10px 0}
+  .lut-cell{min-width:46px;height:50px;border:1px solid var(--line);border-radius:6px;
+    background:var(--panel-2);display:flex;flex-direction:column;align-items:center;
+    justify-content:center;font-family:var(--mono);font-variant-numeric:tabular-nums;
+    transition:border-color .25s,background .25s}
+  .lut-cell .ix{font-size:10px;color:var(--faint)}
+  .lut-cell .wv{font-size:13px;color:var(--ch-r)}
+  .lut-cell.hit{border-color:var(--ch-b);background:#14222e}
+  .lut-cell.hit .wv{color:var(--ch-b)}
+  .tok-row{display:flex;gap:3px;flex-wrap:wrap;margin:6px 0}
+  .tok-cell{min-width:52px;height:52px;border:1px solid var(--line);border-radius:6px;
+    background:var(--panel-2);display:flex;flex-direction:column;align-items:center;
+    justify-content:center;font-family:var(--mono);font-variant-numeric:tabular-nums;
+    cursor:pointer;transition:border-color .2s,background .2s}
+  .tok-cell:focus-visible{outline:2px solid var(--ch-b);outline-offset:2px}
+  .tok-cell .d{font-size:10px;color:var(--faint)}
+  .tok-cell .cv{font-size:14px;color:var(--ink)}
+  .tok-cell.sel{border-color:var(--ch-b);background:#14222e}
+  .tok-cell.sel .cv{color:var(--ch-b)}
+  .row-label{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px}
+  .out-cell .cv{color:var(--ch-r)}
+
+  /* decode blow-up */
+  .byte-bars{display:grid;gap:10px;margin-top:16px}
+  .byte-row{display:grid;grid-template-columns:minmax(170px,220px) 1fr 120px;gap:12px;align-items:center}
+  .byte-row .lbl{font-family:var(--mono);font-size:12.5px;color:var(--muted);text-align:right}
+  .byte-row .lbl small{display:block;color:var(--faint);font-size:11px}
+  .byte-row .track{height:26px;background:#0b111c;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .byte-row .bar{height:100%;transition:width .7s cubic-bezier(.2,.8,.2,1);
+    background:linear-gradient(90deg,#31537a,var(--ch-b))}
+  .byte-row.bad .bar{background:linear-gradient(90deg,#6e2c40,var(--bad))}
+  .byte-row.win .bar{background:linear-gradient(90deg,#2f5e3c,var(--ok))}
+  .byte-row .val{font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+  /* split-identity table */
+  .split-line{font-family:var(--mono);font-size:15px;margin:14px 0;line-height:2.1}
+  .split-line .cterm{color:var(--ch-a);border-bottom:2px solid #7a5a2c;padding-bottom:2px}
+  .split-line .rterm{color:var(--ch-b);border-bottom:2px solid #2c5a6e;padding-bottom:2px}
+  .split-line b{color:var(--ok)}
+
+  /* bit-width explorer */
+  .bits-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:16px}
+  .bits-card{border:1px solid var(--line);border-radius:10px;padding:16px;background:var(--panel-2);
+    transition:border-color .3s,box-shadow .3s}
+  .bits-card.live{border-color:var(--ch-b);box-shadow:0 0 18px rgba(89,199,227,.12)}
+  .bits-card h4{font-family:var(--mono);font-size:14.5px;margin-bottom:8px}
+  .bits-card .meta{font-family:var(--mono);font-size:12.5px;color:var(--muted);line-height:1.9}
+  .bits-card .meta b{color:var(--ink)}
+  .bits-card .idn{font-family:var(--mono);font-size:12.5px;color:var(--ch-r);margin-top:8px;
+    border-top:1px dashed var(--line);padding-top:8px}
+  .bits-card .status{display:inline-block;font-family:var(--mono);font-size:10.5px;
+    letter-spacing:.1em;text-transform:uppercase;padding:2px 9px;border-radius:99px;
+    border:1px solid var(--line);margin-top:10px;color:var(--muted)}
+  .bits-card .status.done{border-color:#2f5e3c;color:var(--ok)}
+  .bits-card .status.ex{border-color:#7a5a2c;color:var(--ch-a)}
+</style>
+</head>
+<body>
+<div class="course-bar">
+  <span class="brand">nano-plaid · SIMD school</span>
+  <nav class="tabs" aria-label="Classes">
+    <a href="./" class="tab">Class 01 · SIMD from zero</a>
+    <a href="class2.html" class="tab">Class 02 · MaxSim via GEMM</a>
+    <a href="class3.html" class="tab">Class 03 · the 1-bit × int8 kernel</a>
+    <a href="class4.html" class="tab active">Class 04 · the residual LUT kernel</a>
+    <a href="https://github.com/joe32140/nano-plaid" class="tab">repo ↗</a>
+  </nav>
+</div>
+
+<main>
+<header>
+  <span class="eyebrow">class 04 · builds on classes 02–03 — <b>the GEMM bar, fusion, dot instructions</b></span>
+  <h1>Retiring our own best advice.</h1>
+  <p class="hero-sub">Class 02 ended with a rule: for 4-bit residual codes, <b>decompress and
+  let BLAS multiply — you won't beat it</b>. This class is the story of beating it 13.6× —
+  not by out-multiplying BLAS, but by generalizing class 03's one-bit identity to a
+  <b>16-entry lookup table</b> and never materializing the floats at all. One worked example
+  (the same 8-dim query as class 03) carries through; every number at the end is measured,
+  on three CPUs.</p>
+
+  <nav class="toc" aria-label="Chapters">
+    <span class="eyebrow">chapters</span>
+    <ol>
+      <li><a href="#r1"><span class="n">01</span> The uncomfortable table</a></li>
+      <li><a href="#r2"><span class="n">02</span> Anatomy of a residual token</a></li>
+      <li><a href="#r3"><span class="n">03</span> Split the dot product</a></li>
+      <li><a href="#r4"><span class="n">04</span> One table to rule every dim</a></li>
+      <li><a href="#r5"><span class="n">05</span> 2P − T was a special case</a></li>
+      <li><a href="#r6"><span class="n">06</span> tbl: 16 lookups, 1 instruction</a></li>
+      <li><a href="#r7"><span class="n">07</span> The kernel: fusion, again</a></li>
+      <li><a href="#r8"><span class="n">08</span> Measured, three ways</a></li>
+      <li><a href="#r9"><span class="n">09</span> Does it cover 1, 2, and 4 bits?</a></li>
+      <li><a href="#r10"><span class="n">10</span> Check yourself</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ═══ 01 THE TABLE ═══ -->
+<section id="r1">
+  <span class="eyebrow">01 · the itch</span>
+  <h2>The uncomfortable table</h2>
+  <p class="lede">After classes 02 and 03, nano-plaid's profile on full SciFact looked like
+  this — best quality in one column, best speed in another, never both:</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>scheme</th><th>NDCG@10</th><th>retention</th><th>p50 / query</th><th>rescore path</th></tr>
+      <tr><td class="mono">residual-4</td><td class="mono">0.7567</td><td class="mono">99.2%</td>
+          <td class="mono" style="color:var(--bad)">114 ms</td><td>decompress → BLAS GEMM (class 02's rung C)</td></tr>
+      <tr><td class="mono">binary + rust</td><td class="mono">0.7460</td><td class="mono">97.8%</td>
+          <td class="mono" style="color:var(--ok)">8.2 ms</td><td>fused SIMD, no decompression (class 03)</td></tr>
+    </table>
+  </div>
+
+  <p>The 1-bit kernel was fast <em>because it never decompressed</em>; the 4-bit scheme was
+  accurate <em>because it kept more information</em> — and paid for it by decompressing
+  512 bytes of floats per token so a float engine could multiply them. We even wrote the
+  justification into the README: <em>"BLAS is already the fast path a hand kernel can't
+  beat."</em> True — and, it turns out, beside the point. The rest of this class removes that
+  row's red number without touching its NDCG column.</p>
+</section>
+
+<!-- ═══ 02 ANATOMY ═══ -->
+<section id="r2">
+  <span class="eyebrow">02 · know your bytes</span>
+  <h2>Anatomy of a residual token</h2>
+  <p class="lede">A residual-4 token is not a mystery blob. It is exactly two things — a
+  pointer and corrections (dim 128 shown; our worked example uses dim 8 to fit on screen):</p>
+
+  <div class="widget" style="background:var(--panel-2)">
+    <div class="strip-row"><span class="strip-label">centroid id</span>
+      <div class="strip"><div class="lane a" style="min-width:90px">cid · 4 B</div></div></div>
+    <div class="strip-row"><span class="strip-label">residual codes</span>
+      <div class="strip"><div class="lane b" style="min-width:66px">4-bit</div><div class="lane b" style="min-width:66px">4-bit</div><div class="lane b ghost" style="min-width:130px">… ×128 = 64 B</div></div></div>
+    <p class="note">Decode says: <code>token ≈ centroid[cid] + weights[codes]</code> — jump to
+    the cluster center, then nudge each dimension by one of 16 learned correction values.
+    <b>68 bytes stored; 512 bytes after decoding to float.</b></p>
+  </div>
+
+  <p>And that ×7.5 blow-up is charged <em>per token, per query, at search time</em> — the
+  price of admission to GEMM. Chapter 06 of class 02 told you why that hurts: GEMM's whole
+  power is FLOPs per byte, and decompression multiplies the bytes:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">bytes touched per doc token at rescore time</span>
+      <div class="controls"><button class="primary" id="byteRun">▶ compare</button></div>
+    </div>
+    <div class="byte-bars">
+      <div class="byte-row bad" id="br0">
+        <div class="lbl">decompress → GEMM<small>materialize floats, then multiply</small></div>
+        <div class="track"><div class="bar"></div></div>
+        <div class="val">512 B <small>+ decode work</small></div>
+      </div>
+      <div class="byte-row win" id="br1">
+        <div class="lbl">score the codes directly<small>this class</small></div>
+        <div class="track"><div class="bar"></div></div>
+        <div class="val">68 B</div>
+      </div>
+    </div>
+    <p class="note">The path is memory-bound (class 02, ch 06) — so 7.5× fewer bytes is not a
+    nicety, it's the headroom. The question is only whether the <em>arithmetic</em> can be
+    done on codes without decoding them. It can.</p>
+  </div>
+</section>
+
+<!-- ═══ 03 SPLIT ═══ -->
+<section id="r3">
+  <span class="eyebrow">03 · one line of algebra, again</span>
+  <h2>Split the dot product</h2>
+  <p class="lede">Class 03 split the dot over set and unset bits. Here the split follows the
+  token's own anatomy — the dot product distributes over <code>centroid + residual</code>:</p>
+
+  <div class="split-line">
+    q · token &nbsp;=&nbsp; <span class="cterm">q · centroid[cid]</span> &nbsp;+&nbsp;
+    <span class="rterm">Σ<sub>d</sub> q<sub>d</sub> · weights[code<sub>d</sub>]</span>
+  </div>
+
+  <p>Now stare at each term until it stops looking like work:</p>
+  <p><span style="color:var(--ch-a)">■</span> <strong>The centroid term is already computed.</strong>
+  Stage 1 of the search scored every query token against every centroid — one small GEMM,
+  <code>[nq, K]</code> — to pick which clusters to probe. The rescore gets that matrix for
+  free; per (query row, token) this term is <em>one table lookup</em>.</p>
+  <p><span style="color:var(--ch-b)">■</span> <strong>The residual term never needs floats.</strong>
+  Quantize the query to int8 (class 03's move, unchanged) and the 16 weights to int8 (a new,
+  16-entry quantization — near-lossless, they're just 16 numbers). Then it's an integer dot
+  between the query row and <em>looked-up bytes</em>. Watch it on the worked example:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">the worked example — class 03's query row, dim 8</span>
+      <div class="controls"><button class="primary" id="splitRun">▶ score one token</button>
+      <button id="splitReset">reset</button></div>
+    </div>
+    <div class="row-label">query row (int8, scale s_q = 0.0113)</div>
+    <div class="tok-row" id="spQ"></div>
+    <div class="row-label">token's residual codes (4-bit indices)</div>
+    <div class="tok-row" id="spC"></div>
+    <div class="row-label">looked-up weights w[code] (int8, scale s_w = 0.0019)</div>
+    <div class="tok-row" id="spW"></div>
+    <div class="id-readout">
+      <div class="id-box r"><span class="lab">residual · Σ q·w[code]</span><div class="val" id="spAcc">—</div></div>
+      <div class="id-box c"><span class="lab">centroid · cdot[cid]</span><div class="val" id="spC2">—</div></div>
+      <div class="id-box s"><span class="lab">score · s_q·s_w·acc + cdot</span><div class="val" id="spS">—</div></div>
+    </div>
+    <p class="note" id="spNote">Press run — every multiply is an integer multiply; float
+    appears exactly once, at the very end.</p>
+  </div>
+</section>
+
+<!-- ═══ 04 SHARED TABLE ═══ -->
+<section id="r4">
+  <span class="eyebrow">04 · the structural gift</span>
+  <h2>One table to rule every dim</h2>
+  <p class="lede">Here is the fact the whole kernel stands on, and it's a property of how the
+  codec is <em>trained</em>: nano-plaid buckets the residual distribution <strong>globally</strong>
+  — so there is ONE 16-entry weight table, shared by every dimension of every token of every
+  document. Hover any code below:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">4 doc tokens × 8 dims of codes — all pointing into the same 16 weights</span></div>
+    <div class="row-label">the entire decoder (16 int8 weights)</div>
+    <div class="lut-strip" id="shLut"></div>
+    <div id="shToks"></div>
+    <p class="note"><b>Why this matters:</b> a 16-entry × 1-byte table is 16 bytes — it fits
+    inside a single SIMD register. Product-quantization codecs (FAISS-style PQ) train a
+    <em>different</em> table per subspace; scalar codecs like this one pay a little accuracy
+    for a table so small the lookup can happen <em>inside the CPU core, in one instruction</em>
+    (chapter 06). No memory traffic, no decode buffer, no per-dim anything.</p>
+  </div>
+</section>
+
+<!-- ═══ 05 GENERALIZE ═══ -->
+<section id="r5">
+  <span class="eyebrow">05 · the reveal</span>
+  <h2>2P − T was a special case all along</h2>
+  <p class="lede">Write the residual term grouped by table entry instead of by dimension:
+  <code>Σ_d q_d·w[code_d] = Σ_c w_c · S_c</code>, where S_c sums the query values whose code
+  is c. Now drag the bit width down and watch class 03 fall out:</p>
+
+  <div class="widget">
+    <div class="widget-head"><span class="widget-title">the identity family — one knob: bits per value</span></div>
+    <div class="sliderline">
+      <label for="bitSlider">nbits =</label>
+      <input type="range" id="bitSlider" min="0" max="2" value="2" step="1"
+             aria-label="bits per value: 1, 2 or 4">
+      <b id="bitLabel" style="color:var(--ch-b);font-size:18px">4</b>
+    </div>
+    <div class="bits-grid" id="bitsGrid"></div>
+    <p class="note">At nbits = 1 the table is {−1, +1}: <code>Σ w_c·S_c = S₁ − S₀ =
+    P − (T − P) = <b>2P − T</b></code> — class 03's entire identity, recovered as the 2-entry
+    row of this one. The lookup table was always there; with two entries it just hid inside
+    a subtraction.</p>
+  </div>
+</section>
+
+<!-- ═══ 06 TBL ═══ -->
+<section id="r6">
+  <span class="eyebrow">06 · the new instrument</span>
+  <h2>tbl / pshufb: sixteen lookups, one instruction</h2>
+  <p class="lede">Class 03 needed a dot-product instruction; this class adds one more to your
+  toolbox. NEON's <code>tbl</code> (x86: <code>pshufb</code>) treats one register as a 16-entry
+  byte table and another as 16 indices — and performs all 16 lookups in a single instruction.
+  Step through it:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">one 16-byte register of codes → weights, in-register</span>
+      <div class="controls"><button class="primary" id="tblStep">step</button>
+      <button id="tblReset">reset</button></div>
+    </div>
+    <div class="row-label">the weight table (one register, loaded once per query)</div>
+    <div class="lut-strip" id="tblLut"></div>
+    <div class="row-label">indices — a packed byte holds TWO codes; high nibbles shown (even dims)</div>
+    <div class="tok-row" id="tblIdx"></div>
+    <div class="row-label">result — 16 weight bytes, ready for class 03's sdot</div>
+    <div class="tok-row" id="tblOut"></div>
+    <p class="note" id="tblNote">This exact instruction is the engine of FAISS's 4-bit
+    "fast-scan" and llama.cpp's Q4 kernels — in-register table lookup is <em>the</em>
+    established way to score 4-bit codes. What's ours is the composition: fusing it into
+    MaxSim's doc-token-outer loop with the centroid term riding stage 1's matrix.</p>
+  </div>
+</section>
+
+<!-- ═══ 07 KERNEL ═══ -->
+<section id="r7">
+  <span class="eyebrow">07 · assembly of known parts</span>
+  <h2>The kernel: fusion, again</h2>
+  <p class="lede">Everything else you already know from class 03 — same fusion, same loop
+  order, one new wrinkle at the end:</p>
+
+  <div class="code-cols">
+    <div class="codebox"><div class="cap">ARM · NEON (tbl + sdot) — per doc token</div>
+<pre><span class="cm">// expand ONCE, amortize over all query rows</span>
+<span class="kw">for</span> chunk <span class="kw">in</span> 0..4:        <span class="cm">// 16 B codes each</span>
+  v  = <span class="fn">ld1</span>  codes[chunk]
+  hi = <span class="fn">ushr</span> v, #4          <span class="cm">// even dims</span>
+  lo = <span class="fn">and</span>  v, 0x0F        <span class="cm">// odd dims</span>
+  w  = <span class="fn">tbl</span>  table, hi/lo   <span class="cm">// ← ch 06</span>
+<span class="cm">// per query row: class 03's inner loop</span>
+<span class="kw">for</span> qi:
+  acc = 8 × <span class="fn">sdot</span>(q_perm, w)
+  s = s_qw[qi]·acc + cdot[cid][qi]  <span class="cm">// f32!</span>
+  best[qi] = <span class="fn">max</span>(best[qi], s)</pre></div>
+    <div class="codebox"><div class="cap">x86 · AVX2 (pshufb + sign-transfer)</div>
+<pre>w  = <span class="fn">pshufb</span>(table, nibbles)   <span class="cm">// lookup</span>
+<span class="cm">// no signed×signed byte-dot on AVX2 —
+// transfer q's sign onto w instead:</span>
+ws = <span class="fn">psignb</span>(w, q)             <span class="cm">// w·sign(q)</span>
+p  = <span class="fn">pmaddubsw</span>(|q|, ws)       <span class="cm">// u8×i8 pairs</span>
+acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen i32</span>
+<span class="cm">// |q|,w ≤ 127 → pair sum ≤ 32258:
+// the i16 lanes can never saturate —
+// that's WHY quantize_lut clips to ±127</span></pre></div>
+  </div>
+
+  <p>The wrinkle: <strong>the max moved to float.</strong> Class 03's kernel kept every score
+  an integer until the very end, because one shared scale can't change which token wins a max.
+  Here the centroid term differs per token, so each (query row, token) score must fold to f32
+  <em>before</em> comparing. That costs a horizontal add and two float ops per pair — it's the
+  main reason this kernel runs ~2.4× the binary kernel's time instead of matching it. Still
+  bit-identical across scalar, NEON, and AVX2 rungs — the f32 operation order is part of the
+  spec, tested on every CI platform.</p>
+</section>
+
+<!-- ═══ 08 MEASURED ═══ -->
+<section id="r8">
+  <span class="eyebrow">08 · the receipts</span>
+  <h2>Measured, three ways</h2>
+  <p class="lede">Kernel microbench (Apple M4, idle, 32-token query × 2000 docs × 80 tokens),
+  then end-to-end, then across CPUs:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">µs per doc — lower is better</span>
+      <div class="controls"><button class="primary" id="benchRun">▶ draw</button></div>
+    </div>
+    <div class="bench" id="benchArea"></div>
+    <p class="note">The scalar LUT rung repeats the ladder's oldest lesson a third time: the
+    identity alone is <em>slower</em> than the float loop (0.78×). All of the speedup lives in
+    the fusion + the two hardware instructions.</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>end to end · full SciFact</th><th>NDCG@10</th><th>p50 / query</th></tr>
+      <tr><td class="mono">residual-4, numpy (decompress → GEMM)</td><td class="mono">0.7567</td><td class="mono">114 ms</td></tr>
+      <tr><td class="mono">residual-4, fused LUT kernel</td><td class="mono">0.7562</td><td class="mono" style="color:var(--ok)"><b>8.4 ms — 13.6×</b></td></tr>
+      <tr><td class="mono">binary, fused kernel (reference)</td><td class="mono">0.7460</td><td class="mono">8.2 ms</td></tr>
+    </table>
+  </div>
+  <p>Read the quality column carefully: the fused path costs <strong>−0.0005 NDCG</strong> —
+  the int8 error lands only on the <em>residual</em>, and the centroid term (most of the
+  magnitude) stays float. The uncomfortable table from chapter 01 is resolved: best-quality
+  scheme, binary-path speed.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>CI platform (shared VMs — ratios, not absolutes)</th><th>binary fused</th><th>residual-4 fused</th></tr>
+      <tr><td class="mono x86">x86-64 AVX2 <span class="pill">ubuntu</span></td><td class="mono">7.9 µs/doc</td><td class="mono">13.1 µs/doc</td></tr>
+      <tr><td class="mono arm">Apple M1 <span class="pill">macos</span></td><td class="mono">2.7 µs/doc</td><td class="mono">7.1 µs/doc</td></tr>
+      <tr><td class="mono arm">Neoverse N2 <span class="pill">ubuntu-arm</span></td><td class="mono">4.9 µs/doc</td><td class="mono">8.5 µs/doc</td></tr>
+    </table>
+  </div>
+  <p>The third runner earned its place the day it was added: it caught the <code>sdot</code>
+  assembly relying on Apple's baseline features (a one-line <code>.arch_extension</code> fix),
+  and it settled class 03's SMMLA cliffhanger — the instruction that only <em>tied</em> SDOT
+  on the M4 wins <strong>1.40×</strong> on Neoverse, so the dispatcher now prefers it wherever
+  <code>i8mm</code> exists. Measure on more than one microarchitecture; keep your negative
+  results.</p>
+</section>
+
+<!-- ═══ 09 COVERAGE ═══ -->
+<section id="r9">
+  <span class="eyebrow">09 · scope, honestly</span>
+  <h2>Does it cover 1, 2, and 4 bits?</h2>
+  <p class="lede">The <em>identity</em> covers all three — chapter 05 is the proof. The
+  <em>kernels</em> stand today like this:</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>scheme</th><th>table</th><th>payload B/token</th><th>NDCG@10</th><th>fused kernel</th></tr>
+      <tr><td class="mono">binary (nbits=1)</td><td class="mono">{−1,+1}</td><td class="mono">16</td><td class="mono">0.7460</td>
+          <td>✅ class 03's — the 1-bit <em>instance</em>: a bit mask replaces the lookup, the max stays integer</td></tr>
+      <tr><td class="mono">residual-2</td><td class="mono">4 entries</td><td class="mono">32 + 4</td><td class="mono">0.7340</td>
+          <td>⬜ not yet — <a href="https://github.com/joe32140/nano-plaid/blob/main/kernels/README.md">exercise 5</a>: same <code>tbl</code>, a cheaper 2-bit unpack</td></tr>
+      <tr><td class="mono">residual-4</td><td class="mono">16 entries</td><td class="mono">64 + 4</td><td class="mono">0.7567</td>
+          <td>✅ this class</td></tr>
+    </table>
+  </div>
+
+  <p>Three honest observations. <strong>First</strong>, binary didn't need retrofitting: its
+  specialized form is <em>better</em> than running it through the general kernel — with only
+  two weights the "lookup" degenerates to the mask class 03 already built, there's no centroid
+  term, and the max stays in integers. The general identity tells you why the special case was
+  possible; it doesn't replace it. <strong>Second</strong>, residual-2 is deliberately an
+  exercise: everything transfers (4-entry table fits in the same register sixteen times over),
+  only the nibble-unpack changes — and its quality column (0.7340, <em>below</em> binary at
+  1.8× the bytes) makes you ask whether it earns a kernel at all. That question — not the
+  SIMD — is the exercise. <strong>Third</strong>, the pattern is the same one that produced
+  class 03: find the identity, quantize the operands, fuse the loop, measure on every
+  platform. next-plaid's residual rescore is still <code>decompress → GEMM</code>; this kernel
+  is the port candidate.</p>
+</section>
+
+<!-- ═══ 10 QUIZ ═══ -->
+<section id="r10">
+  <span class="eyebrow">10 · check yourself</span>
+  <h2>Six questions</h2>
+  <p class="lede">Instant feedback, explanations included. Miss one? The chapter number is next
+  to it.</p>
+  <div id="quiz"></div>
+  <div class="score" id="scoreLine"></div>
+</section>
+
+<a class="next-class" href="./"><span class="k">↺ back to class 01</span>
+<span class="t">The course loops: lanes → GEMM → bits → tables. Now go port something.</span></a>
+
+<footer>
+  <p>Class 04 of the <a href="https://github.com/joe32140/nano-plaid">nano-plaid</a> SIMD
+  school. The numpy spec is <span class="mono">nanoplaid.quantize_lut / score_residual_lut</span>;
+  the kernels are <span class="mono">maxsim_r4_*</span> in
+  <span class="mono">kernels/src/lib.rs</span>, bit-identity-tested against the spec on x86
+  AVX2, Apple NEON, and Neoverse NEON in CI. All latency figures measured
+  (<span class="mono">eval.py --profile</span>, full SciFact, Apple M4).</p>
+</footer>
+</main>
+
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const mk=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;};
+const reduced=matchMedia("(prefers-reduced-motion: reduce)").matches;
+const sleep=ms=>new Promise(r=>setTimeout(r,reduced?0:ms));
+
+/* ── the worked example ─────────────────────────────────────────────── */
+const Q=[12,-7,3,25,-14,6,-2,9];                 // class 03's query row
+const SQ=0.0113, SW=0.0019;
+const LUT=[-127,-90,-69,-53,-37,-26,-16,-5,5,16,26,37,53,69,90,127];
+const CODES=[3,12,0,15,7,9,1,14];
+const CDOT=0.4183;
+
+/* ── 02: byte bars ──────────────────────────────────────────────────── */
+(function(){
+  let ran=false;
+  $("byteRun").addEventListener("click",()=>{
+    if(ran)return;ran=true;
+    $("br0").querySelector(".bar").style.width="100%";
+    $("br1").querySelector(".bar").style.width=(68/512*100)+"%";
+  });
+})();
+
+/* ── 03: split scorer ───────────────────────────────────────────────── */
+(function(){
+  function cell(top,bot,cls){
+    const c=mk("div","tok-cell"+(cls?" "+cls:""));
+    c.append(mk("span","d",top),mk("span","cv",bot));
+    return c;
+  }
+  function draw(){
+    $("spQ").innerHTML="";$("spC").innerHTML="";$("spW").innerHTML="";
+    Q.forEach((v,i)=>$("spQ").append(cell("d"+i,v)));
+    CODES.forEach((v,i)=>$("spC").append(cell("d"+i,v)));
+    CODES.forEach((_,i)=>$("spW").append(cell("d"+i,"·","out-cell")));
+    $("spAcc").textContent="—";$("spC2").textContent="—";$("spS").textContent="—";
+    $("spNote").textContent="Press run — every multiply is an integer multiply; float appears exactly once, at the very end.";
+  }
+  let running=false;
+  async function run(){
+    if(running)return;running=true;
+    draw();
+    const wCells=[...$("spW").children],cCells=[...$("spC").children];
+    let acc=0;
+    for(let i=0;i<8;i++){
+      cCells[i].classList.add("sel");
+      const w=LUT[CODES[i]];
+      wCells[i].querySelector(".cv").textContent=w;
+      wCells[i].classList.add("sel");
+      acc+=Q[i]*w;
+      $("spAcc").textContent=acc;
+      await sleep(240);
+      cCells[i].classList.remove("sel");
+    }
+    await sleep(200);
+    $("spC2").textContent=CDOT.toFixed(4);
+    await sleep(300);
+    const s=SQ*SW*acc+CDOT;
+    $("spS").textContent=s.toFixed(4);
+    $("spNote").innerHTML="score = 0.0113 × 0.0019 × "+acc+" + "+CDOT.toFixed(4)+" = <b>"+s.toFixed(4)+
+      "</b>. The centroid term came from stage 1's matrix — zero extra work. No float token was ever built.";
+    running=false;
+  }
+  $("splitRun").addEventListener("click",run);
+  $("splitReset").addEventListener("click",()=>{if(!running)draw();});
+  draw();
+})();
+
+/* ── 04: shared table hover ─────────────────────────────────────────── */
+(function(){
+  const lut=$("shLut");
+  LUT.forEach((w,i)=>{
+    const c=mk("div","lut-cell");
+    c.append(mk("span","ix",String(i)),mk("span","wv",String(w)));
+    lut.append(c);
+  });
+  const lutCells=[...lut.children];
+  const toks=$("shToks");
+  // 4 pseudo-random-but-fixed token code rows
+  const ROWS=[CODES,[0,8,15,4,4,11,6,2],[13,1,7,7,10,5,15,0],[2,14,9,3,8,12,5,11]];
+  ROWS.forEach((row,t)=>{
+    const lab=mk("div","row-label","doc token "+t);
+    const tr=mk("div","tok-row");
+    row.forEach((code,i)=>{
+      const c=mk("div","tok-cell");
+      c.tabIndex=0;
+      c.append(mk("span","d","d"+i),mk("span","cv",String(code)));
+      const on=()=>{c.classList.add("sel");lutCells[code].classList.add("hit");};
+      const off=()=>{c.classList.remove("sel");lutCells[code].classList.remove("hit");};
+      c.addEventListener("mouseenter",on);c.addEventListener("mouseleave",off);
+      c.addEventListener("focus",on);c.addEventListener("blur",off);
+      tr.append(c);
+    });
+    toks.append(lab,tr);
+  });
+})();
+
+/* ── 05: bit-width explorer ─────────────────────────────────────────── */
+(function(){
+  const CARDS=[
+    {bits:1,name:"binary",table:"{−1, +1}",bpt:"16 B",ndcg:"0.7460",
+     idn:"Σ w·S = S₁ − S₀ = 2P − T",
+     status:["done","✅ class 03's kernel"],
+     note:"the mask IS the lookup; max stays integer"},
+    {bits:2,name:"residual-2",table:"4 entries",bpt:"32 + 4 B",ndcg:"0.7340",
+     idn:"Σ w·S over 4 buckets",
+     status:["ex","⬜ exercise 5"],
+     note:"same tbl, cheaper unpack — but read its NDCG first"},
+    {bits:4,name:"residual-4",table:"16 entries",bpt:"64 + 4 B",ndcg:"0.7567",
+     idn:"Σ w·S over 16 buckets + centroid",
+     status:["done","✅ this class"],
+     note:"the 16-byte table fills one register exactly"},
+  ];
+  const grid=$("bitsGrid");
+  CARDS.forEach(cd=>{
+    const el=mk("div","bits-card");
+    el.innerHTML="<h4>nbits = "+cd.bits+" · "+cd.name+"</h4>"+
+      '<div class="meta">table: <b>'+cd.table+"</b><br>payload: <b>"+cd.bpt+"</b> / token (dim 128)<br>NDCG@10: <b>"+cd.ndcg+"</b><br>"+cd.note+"</div>"+
+      '<div class="idn">'+cd.idn+"</div>"+
+      '<div class="status '+cd.status[0]+'">'+cd.status[1]+"</div>";
+    grid.append(el);
+  });
+  const cards=[...grid.children];
+  function upd(){
+    const i=+$("bitSlider").value;
+    $("bitLabel").textContent=CARDS[i].bits;
+    cards.forEach((c,j)=>c.classList.toggle("live",j===i));
+  }
+  $("bitSlider").addEventListener("input",upd);upd();
+})();
+
+/* ── 06: tbl stepper ────────────────────────────────────────────────── */
+(function(){
+  const IDX=[3,12,0,15,7,9,1,14,4,11,6,2,13,8,10,5]; // 16 high-nibble codes
+  const lut=$("tblLut");
+  LUT.forEach((w,i)=>{const c=mk("div","lut-cell");
+    c.append(mk("span","ix",String(i)),mk("span","wv",String(w)));lut.append(c);});
+  const lutCells=[...lut.children];
+  function draw(){
+    $("tblIdx").innerHTML="";$("tblOut").innerHTML="";
+    IDX.forEach((v,i)=>{const c=mk("div","tok-cell");
+      c.append(mk("span","d","b"+i),mk("span","cv",String(v)));$("tblIdx").append(c);});
+    IDX.forEach((_,i)=>{const c=mk("div","tok-cell out-cell");
+      c.append(mk("span","d","b"+i),mk("span","cv","·"));$("tblOut").append(c);});
+    lutCells.forEach(c=>c.classList.remove("hit"));
+    step=0;
+    $("tblNote").textContent="Step through a few lanes — then remember the hardware does all 16 at once, in one cycle-ish.";
+  }
+  let step=0;
+  $("tblStep").addEventListener("click",()=>{
+    if(step>=16){
+      [...$("tblIdx").children].forEach(c=>c.classList.add("sel"));
+      [...$("tblOut").children].forEach((c,i)=>{c.querySelector(".cv").textContent=LUT[IDX[i]];c.classList.add("sel");});
+      $("tblNote").innerHTML="<b>One instruction.</b> The other 15 lanes cost nothing extra — this is the same lane-parallelism as class 01, applied to memory-free table lookup.";
+      return;
+    }
+    const i=step++;
+    lutCells.forEach(c=>c.classList.remove("hit"));
+    lutCells[IDX[i]].classList.add("hit");
+    const ic=[...$("tblIdx").children],oc=[...$("tblOut").children];
+    ic.forEach(c=>c.classList.remove("sel"));ic[i].classList.add("sel");
+    oc[i].querySelector(".cv").textContent=LUT[IDX[i]];oc[i].classList.add("sel");
+    if(step===3){step=16;$("tblNote").textContent="You get the idea — press step once more for the punchline.";}
+  });
+  $("tblReset").addEventListener("click",draw);
+  draw();
+})();
+
+/* ── 08: bench bars ─────────────────────────────────────────────────── */
+(function(){
+  const ROWS=[
+    {lbl:"f32 reference loop",sub:"the yardstick",us:72.6},
+    {lbl:"r4 scalar LUT",sub:"the identity, no SIMD",us:92.5,bad:true},
+    {lbl:"r4 fused tbl + sdot",sub:"this class",us:4.52,win:true},
+    {lbl:"binary fused sdot",sub:"class 03, for scale",us:1.88},
+  ];
+  const area=$("benchArea");
+  ROWS.forEach(r=>{
+    const row=mk("div","bench-row"+(r.win?" win":""));
+    const lbl=mk("div","lbl");lbl.innerHTML=r.lbl+"<br><small style='color:var(--faint)'>"+r.sub+"</small>";
+    const track=mk("div","track");track.append(mk("div","bar"));
+    const val=mk("div","val");val.innerHTML="<b>"+r.us+"</b> µs/doc";
+    row.append(lbl,track,val);area.append(row);
+  });
+  let ran=false;
+  $("benchRun").addEventListener("click",()=>{
+    if(ran)return;ran=true;
+    area.querySelectorAll(".bench-row").forEach((row,i)=>{
+      row.querySelector(".bar").style.width=(ROWS[i].us/92.5*100)+"%";
+    });
+  });
+})();
+
+/* ── 10: quiz ───────────────────────────────────────────────────────── */
+(function(){
+  const QS=[
+    {q:"A residual-4 token is 68 stored bytes. Why does the decompress-to-GEMM path still lose, even though GEMM is near-optimal?",ch:"02",
+     opts:["GEMM rounds 4-bit values incorrectly","Decoding inflates every token to 512 B at query time on a memory-bound path — GEMM multiplies fast, but the bytes are the bottleneck","BLAS can't handle centroids","The residual codes are stored compressed on disk"],right:1,
+     why:"Class 02 ch 06 in reverse: the path is memory-bound, so ×7.5 bytes is ×7.5 of the actual bottleneck. The multiply speed was never the problem."},
+    {q:"Where does the centroid half of every dot product come from in the fused kernel?",ch:"03",
+     opts:["A dedicated centroid GEMM in stage 2","It's approximated as zero","Stage 1 already computed q @ centroids.T to pick probes — the rescore just looks values up in that [nq, K] matrix","The codec stores precomputed dot products"],right:2,
+     why:"The split q·token = q·centroid[cid] + q·w[codes] is powerful precisely because the first term is a lookup into work the search already did."},
+    {q:"What structural property of nano-plaid's codec makes a one-instruction lookup possible?",ch:"04",
+     opts:["Residuals are always positive","The weight table is trained per document","The 16-entry weight table is GLOBAL — shared by every dim of every token — so it fits in one SIMD register","4-bit codes compress better than 8-bit"],right:2,
+     why:"One shared table = 16 bytes = one register = tbl/pshufb. Per-dim or per-subspace tables (PQ-style) would force memory lookups instead."},
+    {q:"How is class 03's 2P − T related to this class's identity Σ w_c·S_c?",ch:"05",
+     opts:["They're unrelated tricks that happen to both use int8","2P − T is the nbits=1 case: with table {−1,+1}, Σ w·S = S₁ − S₀ = P − (T − P)","2P − T is an approximation of the LUT identity","The LUT identity only works when 2P − T fails"],right:1,
+     why:"Drag chapter 05's slider to 1 bit: the lookup table degenerates to a sign and the identity collapses to exactly class 03's formula."},
+    {q:"The fused residual kernel runs ~2.4× slower per doc than the binary kernel. The main structural reason?",ch:"07",
+     opts:["tbl is a slow instruction","The centroid term varies per token, so every (query row, token) score must fold to float before the max — binary kept the whole max in integers","4-bit unpacking defeats the prefetcher","AVX2 lacks a table-lookup instruction"],right:1,
+     why:"Plus 4× the payload bytes. The float fold costs a horizontal add + two float ops per pair; binary's single shared scale let it defer all of that to the very end."},
+    {q:"Does the LUT approach cover binary (1-bit), residual-2, and residual-4?",ch:"09",
+     opts:["Only residual-4 — the others need different algebra","The identity covers all three; kernels: binary already has its (better) specialized 1-bit form, residual-4 is implemented, residual-2 is exercise 5","All three run through one generic kernel in production","Only schemes with a centroid term"],right:1,
+     why:"The identity is universal (ch 05). But the 1-bit instance is *stronger* than the general kernel — mask instead of lookup, integer max — which is why class 03's kernel stays. residual-2 transfers directly; whether its quality earns a kernel is the exercise."}
+  ];
+  let answered=0,correct=0;
+  const box=$("quiz");
+  QS.forEach((Qz,qi)=>{
+    const card=mk("div","q");
+    const head=mk("div","qq");head.innerHTML=(qi+1)+". "+Qz.q+' <span class="dim mono" style="font-size:12px">· ch '+Qz.ch+"</span>";
+    const opts=mk("div","opts");
+    const why=mk("div","why",Qz.why);
+    Qz.opts.forEach((o,oi)=>{
+      const b=mk("button","opt",o);
+      b.addEventListener("click",()=>{
+        if(card.dataset.done)return;card.dataset.done="1";answered++;
+        if(oi===Qz.right){b.classList.add("right");correct++;}
+        else{b.classList.add("wrong");opts.children[Qz.right].classList.add("right");}
+        why.classList.add("show");
+        $("scoreLine").textContent="score: "+correct+" / "+answered+(answered===QS.length?(correct===QS.length?" — perfect. Exercise 5 has your name on it.":" — the chapter numbers point the way back."):"");
+      });
+      opts.append(b);
+    });
+    card.append(head,opts,why);box.append(card);
+  });
+})();
+})();
+</script>
+</body>
+</html>
