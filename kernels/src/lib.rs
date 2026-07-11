@@ -990,14 +990,16 @@ mod neon {
     // the SMMLA-style "make the reduce free" idea without a new query layout.
     //
     // MEASURED on three cores — and the answer is microarchitecture-dependent,
-    // which is the whole lesson. Against the vfold rung (µs/doc):
-    //   Apple M4 (idle local):      2.16 vs 2.19  — a wash (~1%)
-    //   Apple M1 (macos CI):        2.81 vs 3.12  — tr ~10% FASTER
-    //   Neoverse N2 (ubuntu-arm CI): 5.66 vs 5.67 — a wash
-    // So whether the per-row horizontal reduce is a real cost depends on the
-    // core: the wide M4 and the Neoverse N2 hide the `vaddvq` under SDOT
-    // latency, but the narrower M1 does not, and removing it there is a genuine
-    // win. The transpose idea was right — on one of three cores. This flips the
+    // which is the whole lesson. r4, vfold → tr (µs/doc):
+    //   Apple M4 (idle local):      2.19 → 2.11  — a wash (~3%)
+    //   Apple M1 (macos CI):        3.02 → 2.67  — tr ~12% FASTER
+    //   Neoverse N2 (ubuntu-arm CI): 5.63 → 5.62 — a wash
+    // The win is largest on r1 (M1: 3.63 → 2.69, ~26% — it carried the most
+    // per-row scalar work, a reduce AND the affine), which also restores the
+    // nbits-flat line vfold had broken on the M1. So whether the per-row
+    // horizontal reduce is a real cost depends on the core: the wide M4 and the
+    // Neoverse N2 hide the `vaddvq` under SDOT latency, but the narrower M1 does
+    // not, and removing it there is a genuine win. This flips the
     // "bench on more than one microarchitecture" lesson the OTHER way from
     // SMMLA (negative on M4, positive on Neoverse; here, a wash on both of
     // those and a win on the M1). Non-negative on every core measured, so the
