@@ -348,7 +348,13 @@ mod neon {
     #[inline(always)]
     unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
         let out: int32x4_t;
+        // `.arch_extension dotprod` tells the ASSEMBLER to accept the
+        // instruction even when the compile target's baseline is plain
+        // ARMv8.0 (aarch64-unknown-linux-gnu). Apple targets have dotprod in
+        // their baseline, which is why this only failed once CI grew a Linux
+        // ARM runner. Runtime dispatch still gates actually EXECUTING it.
         std::arch::asm!(
+            ".arch_extension dotprod",
             "sdot {out:v}.4s, {a:v}.16b, {b:v}.16b",
             out = inout(vreg) acc => out,
             a = in(vreg) a,
