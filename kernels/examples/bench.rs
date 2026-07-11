@@ -198,9 +198,24 @@ fn main() {
             (ts, tf, tv)
         }};
     }
-    let tr4 = time_rung!(r4_codes, maxsim_r4_scalar, maxsim_r4_fused, maxsim_r4_vfold_fused);
-    let tr2 = time_rung!(r2_codes, maxsim_r2_scalar, maxsim_r2_fused, maxsim_r2_vfold_fused);
-    let tr1 = time_rung!(r1_codes, maxsim_r1_scalar, maxsim_r1_fused, maxsim_r1_vfold_fused);
+    let tr4 = time_rung!(
+        r4_codes,
+        maxsim_r4_scalar,
+        maxsim_r4_fused,
+        maxsim_r4_vfold_fused
+    );
+    let tr2 = time_rung!(
+        r2_codes,
+        maxsim_r2_scalar,
+        maxsim_r2_fused,
+        maxsim_r2_vfold_fused
+    );
+    let tr1 = time_rung!(
+        r1_codes,
+        maxsim_r1_scalar,
+        maxsim_r1_fused,
+        maxsim_r1_vfold_fused
+    );
 
     #[cfg(target_arch = "aarch64")]
     let fused_names = [

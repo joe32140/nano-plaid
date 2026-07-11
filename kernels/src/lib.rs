@@ -522,7 +522,10 @@ mod neon {
         let mut i = 0;
         while i + 4 <= nq {
             let a = vcvtq_f32_s32(vld1q_s32(accs.as_ptr().add(i)));
-            let s = vaddq_f32(vmulq_f32(vld1q_f32(sqw.as_ptr().add(i)), a), vld1q_f32(crow.add(i)));
+            let s = vaddq_f32(
+                vmulq_f32(vld1q_f32(sqw.as_ptr().add(i)), a),
+                vld1q_f32(crow.add(i)),
+            );
             let b = vld1q_f32(best.as_ptr().add(i));
             vst1q_f32(best.as_mut_ptr().add(i), vmaxq_f32(b, s));
             i += 4;
@@ -845,7 +848,12 @@ mod neon {
                 b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
                 *acc_qi = vaddvq_s32(vaddq_s32(a, b));
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -893,7 +901,12 @@ mod neon {
                 b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
                 *acc_qi = vaddvq_s32(vaddq_s32(a, b));
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -932,7 +945,12 @@ mod neon {
                 let p = vaddvq_s32(vaddq_s32(a, b));
                 *acc_qi = dw * p + w0 * q.sums[qi];
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -1460,13 +1478,20 @@ mod x86 {
                     let p16 = _mm256_maddubs_epi16(mag, ws);
                     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
                 }
-                let x =
-                    _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+                let x = _mm_add_epi32(
+                    _mm256_castsi256_si128(acc),
+                    _mm256_extracti128_si256(acc, 1),
+                );
                 let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
                 let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
                 *acc_qi = _mm_cvtsi128_si32(x);
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -1509,13 +1534,20 @@ mod x86 {
                     let p16 = _mm256_maddubs_epi16(mag, ws);
                     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
                 }
-                let x =
-                    _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+                let x = _mm_add_epi32(
+                    _mm256_castsi256_si128(acc),
+                    _mm256_extracti128_si256(acc, 1),
+                );
                 let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
                 let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
                 *acc_qi = _mm_cvtsi128_si32(x);
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -1560,8 +1592,10 @@ mod x86 {
                 as i32;
             for (qi, acc_qi) in accs.iter_mut().enumerate() {
                 let q0 = qp.add(qi * 128);
-                let s0 =
-                    _mm256_sad_epu8(_mm256_and_si256(m0, _mm256_loadu_si256(q0 as *const __m256i)), zero);
+                let s0 = _mm256_sad_epu8(
+                    _mm256_and_si256(m0, _mm256_loadu_si256(q0 as *const __m256i)),
+                    zero,
+                );
                 let s1 = _mm256_sad_epu8(
                     _mm256_and_si256(m1, _mm256_loadu_si256(q0.add(32) as *const __m256i)),
                     zero,
@@ -1579,7 +1613,12 @@ mod x86 {
                 let sad = _mm_cvtsi128_si64(_mm_add_epi64(x, _mm_unpackhi_epi64(x, x))) as i32;
                 *acc_qi = dw * (sad - 128 * cnt) + w0 * q.sums[qi];
             }
-            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+            fold_block(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
         }
         best.iter().sum()
     }
@@ -1906,9 +1945,27 @@ mod tests {
     type RFused = fn(&QueryI8, &LutI8, &[u8], &[u32], &[f32]) -> Option<f32>;
     // (nbits, scalar reference, dispatcher, scalar-fold fused, vfold fused)
     const R_FAMILY: [(usize, RKernel, RKernel, RFused, RFused); 3] = [
-        (4, maxsim_r4_scalar, maxsim_r4, maxsim_r4_fused, maxsim_r4_vfold_fused),
-        (2, maxsim_r2_scalar, maxsim_r2, maxsim_r2_fused, maxsim_r2_vfold_fused),
-        (1, maxsim_r1_scalar, maxsim_r1, maxsim_r1_fused, maxsim_r1_vfold_fused),
+        (
+            4,
+            maxsim_r4_scalar,
+            maxsim_r4,
+            maxsim_r4_fused,
+            maxsim_r4_vfold_fused,
+        ),
+        (
+            2,
+            maxsim_r2_scalar,
+            maxsim_r2,
+            maxsim_r2_fused,
+            maxsim_r2_vfold_fused,
+        ),
+        (
+            1,
+            maxsim_r1_scalar,
+            maxsim_r1,
+            maxsim_r1_fused,
+            maxsim_r1_vfold_fused,
+        ),
     ];
 
     #[test]
