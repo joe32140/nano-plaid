@@ -38,8 +38,25 @@ should halve the instruction count and run ~2× faster. It doesn't — on the M4
 it *ties* rung 4, because Apple's cores issue SMMLA at about half SDOT's rate.
 Half the instructions at half the throughput nets zero. Counting MACs on paper
 predicted a 2× win; the only way to know it evaporates is to run it on the
-actual microarchitecture. (It may still win on cores that issue SMMLA at
-SDOT's rate — some ARM Neoverse parts — which is why it's kept, not deleted.)
+actual microarchitecture.
+
+**Epilogue, measured on CI:** the moment this repo's CI grew a second arm64
+platform (ubuntu-24.04-arm, a Neoverse N2), the prediction in the previous
+paragraph's original ending — *"it may still win on cores that issue SMMLA at
+SDOT's rate"* — came true: **SMMLA 3.46 vs SDOT 4.85 µs/doc, a 1.40× win**
+(shared-VM numbers, treat ratios as the signal). The dispatcher now prefers
+SMMLA wherever `i8mm` exists — a measured ~1% giveback on the M4 bought a
+~40% win on Neoverse/Graviton-class cores. Keeping the "failed" rung, and
+benching it on more than one microarchitecture, is the whole lesson.
+
+Indicative per-platform numbers from CI's shared runners (one run, ratios >
+absolutes; M4 numbers above are from an idle local machine):
+
+| platform | binary fused | residual-4 fused | SMMLA |
+|----------|-------------:|-----------------:|------:|
+| x86_64 AVX2 (ubuntu-latest) | 7.91 µs/doc (28×) | 13.1 µs/doc (17×) | – |
+| Apple M1 (macos-latest) | 2.66 µs/doc (56×) | 7.07 µs/doc (21×) | no i8mm |
+| Neoverse N2 (ubuntu-24.04-arm) | 4.85 µs/doc (32×) | 8.47 µs/doc (18×) | **3.46 µs/doc (45×)** |
 
 ## the math
 

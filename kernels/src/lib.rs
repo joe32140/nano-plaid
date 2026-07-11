@@ -828,9 +828,16 @@ mod x86 {
 // with `-C target-cpu=native`.
 
 pub fn maxsim(q: &QueryI8, bits: &[u8], dim: usize) -> f32 {
-    // SDOT first: rung 5 (SMMLA) only ties it on the M4 (see its comment), so
-    // there's no reason to prefer the more complex kernel. SMMLA stays exposed
-    // for the bench and for cores that may issue it faster.
+    // SMMLA first where i8mm exists: this ordering is itself a MEASURED
+    // decision, and it flipped once CI grew a second arm64 platform. On the
+    // Apple M4, SMMLA only ties SDOT (0.99×, see its comment) — but on the
+    // Neoverse N2 CI runner it wins 1.40× (3.46 vs 4.85 µs/doc), exactly the
+    // issue-rate difference the rung-5 writeup predicted. Cost of preferring
+    // it on Apple: ~1%. Benefit on Neoverse/Graviton-class cores: ~40%.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(v) = maxsim_smmla(q, bits, dim) {
+        return v;
+    }
     #[cfg(target_arch = "aarch64")]
     if let Some(v) = maxsim_sdot(q, bits, dim) {
         return v;

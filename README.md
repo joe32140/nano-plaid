@@ -182,9 +182,12 @@ rebuilt in Rust as five rungs, from scalar reference to a fused SIMD kernel
 benchmarked on the way up (spoiler: the algebraic identity alone makes things
 *slower*; the memory layout and loop order are the speedup — 38× by rung 4).
 Rung 5 swaps SDOT for the denser SMMLA matrix instruction, which *should* be
-2× and instead ties — a measured lesson in why you don't trust a MAC count
-without running it. Plus field notes on the three ways microbenchmarks lied to
-us while building the production version. See [kernels/README.md](kernels/README.md).
+2× and instead ties on the M4 — a measured lesson in why you don't trust a MAC
+count without running it. The epilogue is better: CI's Neoverse arm64 runner
+later proved SMMLA **1.40× faster** there, so the "failed" rung now wins the
+dispatch on `i8mm` cores — keep your negative results. Plus field notes on the
+three ways microbenchmarks lied to us while building the production version.
+See [kernels/README.md](kernels/README.md).
 
 There is a **second ladder** for residual-4: the same `2P − T` idea
 generalized to a 16-entry weight table (one in-register `tbl`/`pshufb` lookup
