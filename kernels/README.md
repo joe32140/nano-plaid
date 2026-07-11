@@ -65,6 +65,12 @@ machinery, cheaper than the shufb + sign-transfer chain), while on both ARM
 cores r1 is the slowest. Same source, three CPUs, three different orderings —
 the recurring moral of this crate.
 
+(These are the `tbl`+SDOT / shufb rungs. The shipped `_vfold` rungs run the
+same compute with the vectorized fold; the CI bench prints both side by side.
+On the M4 the fold is a flat ~2.1× win across all three rungs — the numbers in
+the second-ladder table above. The AVX2 and Neoverse folds are read off CI and
+folded into this table once the run lands.)
+
 ## the math
 
 Quantize the query row to int8 (`q ≈ scale · v`). Doc values are signs
@@ -104,26 +110,51 @@ binary kernel's machinery verbatim.
 | kernel | idea | µs/doc (M4) | vs f32 loop |
 |--------|------|------------:|------------:|
 | `maxsim_r4_scalar` | the LUT identity, one lookup per value | 93.4 | 0.76× |
-| `maxsim_r4_neon128` | fused `tbl` + SDOT (16-entry table) | 4.55 | 15.6× |
+| `maxsim_r4_neon128` | fused `tbl` + SDOT (16-entry table) | 4.54 | 15.6× |
+| `maxsim_r4_neon128_vfold` | + the fold vectorized | **2.19** | **32.3×** |
 | `maxsim_r2_neon128` | fused `tbl` + SDOT (4-entry table) | 4.54 | 15.7× |
-| `maxsim_r1_neon128` | affine 2P−T + SDOT (no table) | 5.52 | 12.9× |
+| `maxsim_r2_neon128_vfold` | + the fold vectorized | **2.17** | **32.5×** |
+| `maxsim_r1_neon128` | affine 2P−T + SDOT (no table) | 5.48 | 12.9× |
+| `maxsim_r1_neon128_vfold` | + the fold vectorized | **2.35** | **29.9×** |
 
 (Same benchmark shape as the ladder table; the `*_avx2_128` x86 rungs are
 verified bit-identical on CI.) Three lessons in one table. The scalar rung is
 again *slower* than the float loop — the identity is never the speedup. The
-fused rungs cost ~2.4× the binary kernel — NOT because of bytes, but because
-of the float max: the centroid term varies per token, so each (row, token)
-score folds to f32 before comparing instead of staying integer to the end.
-And the per-doc cost is **flat across nbits** — 64, 32, or 16 bytes of codes
-all score in ~4.5–5.5 µs, because the 8-SDOT inner loop and the fold dominate
-while the expansion (what nbits changes) is amortized. At bench scale the
-bytes were never the kernel's bottleneck; they're the *index's* (85 vs 47 vs
-28 MB resident).
+`tbl`+SDOT rungs cost ~2.4× the binary kernel — NOT because of bytes, but
+because of the **float max**: the centroid term varies per token, so each
+(row, token) score folds to f32 before comparing instead of staying integer
+to the end. And the per-doc cost is **flat across nbits** — 64, 32, or 16
+bytes of codes all score in ~4.5–5.5 µs, because the 8-SDOT inner loop and the
+fold dominate while the expansion (what nbits changes) is amortized. At bench
+scale the bytes were never the kernel's bottleneck.
+
+**The `_vfold` rungs prove where that 2.4× lived.** The only change is that the
+per-(row, token) f32 fold — quantize `acc` to float, `sqw·acc + crow`, compare
+against the running max — moves out of the scalar per-row loop into
+`fold_block`, which does four rows per `vmaxq_f32` (eight per `_mm256_max_ps`
+on AVX2). Nothing about the `tbl`/SDOT compute changes, and the scores stay
+bit-identical (the parity test pins it). It **~2.1× every rung** (4.54 → 2.19
+µs on residual-4) and collapses the gap to the binary kernel from 2.4× to
+~1.15×. So the fold *was* the cost, not the payload bytes or the expansion —
+a hypothesis the crate could only settle by building the counterfactual and
+timing it. This is the transferable half of MaxSim: the same vectorized
+max-reduction [mixedbread-ai/maxsim-cpu](https://github.com/mixedbread-ai/maxsim-cpu)
+bolts onto a plain float GEMM. We borrowed it to shore up the residual
+family's one weak spot; it carries past this repo unchanged (it touches
+neither the LUT identity nor the query layout). The shipped dispatcher
+(`maxsim_r{4,2,1}`) now routes here, with the scalar-fold rung kept exposed
+for the head-to-head — unlike SMMLA, the win isn't tied to an instruction's
+issue rate (a branch-free pass plus a wide `max`), so it carries across
+microarchitectures rather than needing a per-core dispatch flip.
 
 End to end this retires the "rust is binary-only" asterisk (full SciFact,
-one sitting): residual-4 drops 111 → **7.9 ms (14×)** at a measured −0.0005
-NDCG, and residual-2 drops 82 → **8.0 ms (10×)** at +0.0009 (noise) — the LUT
-adds int8 error only to the *residual*; the centroid term stays float.
+one sitting): with the vectorized fold, residual-4 drops 111 → **6.9 ms
+(16×)** at a measured −0.0005 NDCG, residual-2 → **6.9 ms**, and residual-1
+→ **7.2 ms** — all within ~15% of the binary path's 6.0 ms. The kernel's 2.1×
+becomes ~1.15× at the query level: Amdahl, since rescore is 85% of the query
+and the gather/probe/rank around it are shared and untouched. The point of
+the fold work was never the end-to-end number — it was proving *which* part of
+the kernel was the tall pole.
 
 **And one measured negative, the family's most interesting number:**
 residual-1 spends *exactly binary's budget* (16 B codes + 4 B centroid id vs
@@ -189,12 +220,16 @@ Each has a production answer in
 4. **Store the expansion?** Precompute each doc token's 128 expanded bytes at
    index time and skip `extract_planes_128`. Measure why this *loses* (hint:
    16 B vs 128 B of memory traffic per token).
-5. **residual-2** *(answered in-tree — `maxsim_r2_*`/`maxsim_r1_*` now exist).*
-   The original question was whether residual-2 could hold its 84 ms numpy
-   latency advantage over residual-4 once both were fused. Measured answer:
-   no — 8.0 vs 7.9 ms, the fused family is nbits-flat, and residual-2's only
-   remaining edge is index size. Follow-up exercise: **close the fold gap.**
-   The residual rungs cost ~2.4× the binary kernel almost entirely from the
-   per-(row, token) scalar f32 fold. Block 4 doc tokens like `maxsim_neon128`
-   does and vectorize the fold (4 accs → one f32x4 max against a gathered
-   cdot vector); how much of the 2.4× can you reclaim?
+5. **The fold gap** *(answered in-tree — `maxsim_r{4,2,1}_*_vfold` now exist).*
+   Two questions, both settled by measurement. First: could residual-2 hold
+   its numpy latency edge over residual-4 once both were fused? No — the fused
+   family is nbits-flat (6.9 vs 6.9 ms), and residual-2's only remaining edge
+   is index size. Second: the `tbl`+SDOT rungs cost ~2.4× the binary kernel —
+   was that the per-(row, token) scalar f32 fold, or the payload bytes? Moving
+   the fold into a vectorized `fold_block` (four rows per `vmaxq_f32`) made it
+   ~2.1× faster with bit-identical scores, collapsing the gap to ~1.15×: the
+   fold was the cost. Follow-up exercise: the `_vfold` kernels still run one
+   `vaddvq_s32` horizontal reduce *per row* to get each `acc`. Transpose the
+   compute SMMLA-style — accumulate four query rows into the four lanes of one
+   `int32x4` — so the reduce is free. How much of the remaining ~1.15× to
+   binary can you reclaim?

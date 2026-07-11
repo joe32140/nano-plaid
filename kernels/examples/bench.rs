@@ -166,9 +166,10 @@ fn main() {
         scale: 0.0031,
     };
 
-    // One timing pair (scalar reference, fused-if-supported) per nbits rung.
+    // One timing triple per nbits rung: scalar reference, scalar-fold fused,
+    // and vectorized-fold fused (both fused kernels if this CPU supports them).
     macro_rules! time_rung {
-        ($codes:expr, $scalar:path, $fused:path) => {{
+        ($codes:expr, $scalar:path, $fused:path, $vfold:path) => {{
             let ts = best_of(|| {
                 $codes
                     .iter()
@@ -185,43 +186,48 @@ fn main() {
                         .sum()
                 })
             });
-            (ts, tf)
+            let tv = $vfold(&q, &lut, &$codes[0], &r4_cids[0], &cdot_t).map(|_| {
+                best_of(|| {
+                    $codes
+                        .iter()
+                        .zip(&r4_cids)
+                        .map(|(c, ids)| $vfold(&q, &lut, c, ids, &cdot_t).unwrap())
+                        .sum()
+                })
+            });
+            (ts, tf, tv)
         }};
     }
-    let (tr4_scalar, tr4_fused) = time_rung!(r4_codes, maxsim_r4_scalar, maxsim_r4_fused);
-    let (tr2_scalar, tr2_fused) = time_rung!(r2_codes, maxsim_r2_scalar, maxsim_r2_fused);
-    let (tr1_scalar, tr1_fused) = time_rung!(r1_codes, maxsim_r1_scalar, maxsim_r1_fused);
+    let tr4 = time_rung!(r4_codes, maxsim_r4_scalar, maxsim_r4_fused, maxsim_r4_vfold_fused);
+    let tr2 = time_rung!(r2_codes, maxsim_r2_scalar, maxsim_r2_fused, maxsim_r2_vfold_fused);
+    let tr1 = time_rung!(r1_codes, maxsim_r1_scalar, maxsim_r1_fused, maxsim_r1_vfold_fused);
 
     #[cfg(target_arch = "aarch64")]
     let fused_names = [
-        "r4      fused NEON tbl  ",
-        "r2      fused NEON tbl  ",
-        "r1      fused NEON sdot ",
+        ("r4      fused NEON tbl  ", "r4      + vec fold      "),
+        ("r2      fused NEON tbl  ", "r2      + vec fold      "),
+        ("r1      fused NEON sdot ", "r1      + vec fold      "),
     ];
     #[cfg(target_arch = "x86_64")]
     let fused_names = [
-        "r4      fused AVX2 shufb",
-        "r2      fused AVX2 shufb",
-        "r1      fused AVX2 SAD  ",
+        ("r4      fused AVX2 shufb", "r4      + vec fold      "),
+        ("r2      fused AVX2 shufb", "r2      + vec fold      "),
+        ("r1      fused AVX2 SAD  ", "r1      + vec fold      "),
     ];
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let fused_names = [""; 3];
+    let fused_names = [("", ""); 3];
 
     println!("\nfused residual family (LUT identity; packed codes + centroid ids):");
-    for (i, (ts, tf)) in [
-        (tr4_scalar, tr4_fused),
-        (tr2_scalar, tr2_fused),
-        (tr1_scalar, tr1_fused),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    println!("  each rung: scalar-fold fused, then the vectorized-fold twin.");
+    for (i, (ts, tf, tv)) in [tr4, tr2, tr1].into_iter().enumerate() {
         let n = [4, 2, 1][i];
         line(&format!("r{n}      scalar reference"), ts);
-        if let Some(t) = tf {
-            line(fused_names[i], t);
-        } else {
-            println!("  (no fused residual-{n} kernel for this CPU)");
+        match tf {
+            Some(t) => line(fused_names[i].0, t),
+            None => println!("  (no fused residual-{n} kernel for this CPU)"),
+        }
+        if let Some(t) = tv {
+            line(fused_names[i].1, t);
         }
     }
 }

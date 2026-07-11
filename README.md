@@ -108,7 +108,7 @@ comparing *schemes*, not for headline numbers.)
 
 These are the **baseline** numbers — pure numpy, stage 2 scored the honest
 textbook way. The Rust kernels start from this table and cut every scheme to
-6–9 ms (next section). Two rows to read twice. residual-4 is the *quality*
+6–7 ms (next section). Two rows to read twice. residual-4 is the *quality*
 headline: 99.2% retention at 85 MB against a 610 MB float corpus. And
 residual-1 spends **exactly binary's 20 B/token** yet loses 11 NDCG points to
 it — same budget, worse codec. How you spend bits matters more than how many
@@ -127,10 +127,10 @@ absolute ms drift a little run to run — compare within the table):
 | residual-2 | 47 | 6.5 | 82 | 1 / 1 / 99 |
 | residual-1 | 28 | 5.5 | 64 | 1 / 1 / 98 |
 | binary | 28 | 3.6 | 17.7 | 4 / 3 / 94 |
-| residual-4 `--backend rust` | 85 | – | **7.9** | 8 / 6 / 86 |
-| residual-2 `--backend rust` | 47 | – | **8.0** | 8 / 6 / 86 |
-| residual-1 `--backend rust` | 28 | – | 8.9 | 7 / 5 / 88 |
-| binary `--backend rust` | 28 | – | **6.2** | 10 / 7 / 82 |
+| residual-4 `--backend rust` | 85 | – | **6.9** | 9 / 6 / 85 |
+| residual-2 `--backend rust` | 47 | – | **6.9** | 9 / 6 / 85 |
+| residual-1 `--backend rust` | 28 | – | 7.2 | 9 / 6 / 86 |
+| binary `--backend rust` | 28 | – | **6.0** | 10 / 7 / 83 |
 
 Two things the breakdown makes obvious. **Memory:** the binary index is 28 MB
 against a 610 MB float corpus — 22×. **Where the time goes:** thanks to
@@ -148,10 +148,10 @@ the same math executes, never *what* it computes:
 
 | scheme | numpy baseline (stage 2) | p50 | fused kernel | p50 | speedup | NDCG: numpy → rust |
 |--------|--------------------------|----:|--------------|----:|--------:|:-------------------|
-| binary | unpack bits → f32 GEMM | 17.7 | `2P−T`, SDOT/AVX2-SAD | **6.2** | 2.9× | 0.7460 → 0.7460 |
-| residual-4 | decode floats → f32 GEMM | 111 | LUT (`tbl`/`pshufb`) + SDOT | **7.9** | 14× | 0.7567 → 0.7562 |
-| residual-2 | decode floats → f32 GEMM | 82 | LUT + SDOT | **8.0** | 10× | 0.7340 → 0.7349 |
-| residual-1 | decode floats → f32 GEMM | 64 | affine `2P−T` | 8.9 | 7× | 0.6312 → 0.6315 |
+| binary | unpack bits → f32 GEMM | 17.7 | `2P−T`, SDOT/AVX2-SAD | **6.0** | 3.0× | 0.7460 → 0.7460 |
+| residual-4 | decode floats → f32 GEMM | 111 | LUT (`tbl`/`pshufb`) + SDOT, vec fold | **6.9** | 16× | 0.7567 → 0.7562 |
+| residual-2 | decode floats → f32 GEMM | 82 | LUT + SDOT, vec fold | **6.9** | 12× | 0.7340 → 0.7349 |
+| residual-1 | decode floats → f32 GEMM | 64 | affine `2P−T`, vec fold | 7.2 | 9× | 0.6312 → 0.6315 |
 
 The NDCG column is the **non-regression check**: binary is bit-identical by
 construction; the residual rungs differ only by the LUT's int8 rounding
@@ -161,7 +161,7 @@ already in the *baseline* column — the quality loss is a property of the
 1-bit-residual **codec** at this scale, not of the kernels (on the toy sets it
 ties binary on FiQA and NFCorpus).
 
-Two more honest readings. **The 14× is partly a numpy tax:** residual-4's
+Two more honest readings. **The 16× is partly a numpy tax:** residual-4's
 111 ms baseline is ~96% decode machinery (unpack bits, index the table,
 materialize floats) and only ~4 ms of actual GEMM; a compiled decode → GEMM
 (what next-plaid does today) would sit near 15–25 ms, so the win a production
@@ -174,12 +174,17 @@ codes *directly* — an in-register table lookup (NEON `tbl` / AVX2 `pshufb`)
 replaces decompression, and the centroid half of every dot product is a lookup
 into the matrix stage 1 already computed. The binary `2P − T` trick is the
 1-bit special case of this LUT identity. The fused family is nearly
-*nbits-flat* in latency (7.9 / 8.0 / 8.9 ms): the integer dot-product core and
+*nbits-flat* in latency (6.9 / 6.9 / 7.2 ms): the integer dot-product core and
 the float max — which every nbits shares — dominate, while the payload bytes
 (what nbits changes) don't; [Class 04](https://joe32140.github.io/nano-plaid/class4.html)
 walks the cost breakdown. That's also why residual-1 buys no speed with its
 smaller codes, while its quality collapse makes it a measured negative result
-worth reading, not running.
+worth reading, not running. (That shared float max was itself the residual
+kernel's tall pole: vectorizing the fold — the transferable trick
+[mixedbread-ai/maxsim-cpu](https://github.com/mixedbread-ai/maxsim-cpu) applies
+to a plain float GEMM — made every rung ~2.1× faster in isolation and is what
+these shipped p50s already use; [kernels/README](kernels/README.md) has the
+head-to-head.)
 
 **The knob that matters is `n_full`** — how many candidates get exact-rescored.
 Since rescore dominates, it's the recall/latency dial (binary, SciFact):
@@ -238,7 +243,7 @@ numpy, so `eval.py --backend rust` scores stage-2 through them: binary via
 SDOT/AVX2-SAD (identical NDCG@10, 0.7460) and the residual family via the
 fused LUT kernels (−0.0005 NDCG on residual-4). Because centroid pruning makes
 rescore the dominant cost, swapping that one stage cuts SciFact end-to-end p50
-to 6–9 ms for every scheme — the kernels attack the tall bar instead of a
+to 6–7 ms for every scheme — the kernels attack the tall bar instead of a
 rounding error. `kernels/test_bridge.py` pins the bridge to the numpy spec on
 every CI platform (x86 AVX2, Apple NEON, Neoverse NEON).
 
@@ -252,7 +257,7 @@ candidate generator, a different scoring identity — start here, measure with
 `eval.py`, and port to next-plaid when it wins. The binary quantization
 scheme here mirrors the one contributed to next-plaid in
 [PR #155](https://github.com/lightonai/next-plaid/pull/155); the fused
-residual LUT kernels (111 → 7.9 ms here for nbits=4) are the next porting
+residual LUT kernels (111 → 6.9 ms here for nbits=4) are the next porting
 candidate — next-plaid's residual rescore is still `decompress → GEMM`.
 
 ## files

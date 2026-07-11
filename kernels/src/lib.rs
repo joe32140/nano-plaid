@@ -500,6 +500,42 @@ mod neon {
         vst1q_s8(p.add(112), vreinterpretq_s8_u8(vandq_u8(v, one)));
     }
 
+    /// The residual family's float fold, vectorized across query rows.
+    ///
+    /// Every residual rung ends the same way: for one doc token it has an i32
+    /// `acc` per query row, and folds `best[i] = max(best[i], sqw[i]·acc[i] +
+    /// crow[i])`. The scalar-fold kernels do that one row at a time; this does
+    /// four rows per `vmaxq_f32`. It is the transferable half of MaxSim — the
+    /// same max-reduction mixedbread-ai/maxsim-cpu vectorizes on top of a plain
+    /// float GEMM — so it improves the whole family with one helper and carries
+    /// past this repo unchanged.
+    ///
+    /// Bit-identical to the scalar tail on purpose: `vcvtq_f32_s32` is the same
+    /// round-to-nearest as `acc as f32`; the multiply and add stay SEPARATE
+    /// (`vmulq` then `vaddq`, never `vfma`) so the two roundings match the
+    /// spec's `sqw*acc + crow`; and for the finite scores this loop produces,
+    /// `vmaxq_f32(best, s)` equals the scalar `if s > best` select. The parity
+    /// test pins this exactly.
+    #[inline(always)]
+    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, best: &mut [f32]) {
+        let nq = accs.len();
+        let mut i = 0;
+        while i + 4 <= nq {
+            let a = vcvtq_f32_s32(vld1q_s32(accs.as_ptr().add(i)));
+            let s = vaddq_f32(vmulq_f32(vld1q_f32(sqw.as_ptr().add(i)), a), vld1q_f32(crow.add(i)));
+            let b = vld1q_f32(best.as_ptr().add(i));
+            vst1q_f32(best.as_mut_ptr().add(i), vmaxq_f32(b, s));
+            i += 4;
+        }
+        while i < nq {
+            let s = sqw[i] * accs[i] as f32 + *crow.add(i);
+            if s > best[i] {
+                best[i] = s;
+            }
+            i += 1;
+        }
+    }
+
     /// # Safety
     /// Requires `dotprod`; `q.planes` must be populated (dim == 128) and
     /// `bits.len() == n_d * 16`.
@@ -756,6 +792,152 @@ mod neon {
     }
 
     // -----------------------------------------------------------------------
+    // The fold-vectorized twins of the three rungs above. The SDOT/tbl compute
+    // is byte-for-byte identical; the only change is structural — each doc
+    // token's per-row accs land in a scratch buffer, then `fold_block` folds
+    // four rows per instruction instead of one. This is the one place the
+    // residual kernel is slower than binary (binary keeps an integer lane-max;
+    // we fold to f32 per row), so it is the fold worth vectorizing. Whether it
+    // actually pays is a measured question — hence keeping both twins.
+
+    /// # Safety
+    /// As `maxsim_r4_neon128`.
+    pub unsafe fn maxsim_r4_neon128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt = vld1q_s8(lut.values.as_ptr());
+        let low4 = vdupq_n_u8(0x0F);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = vld1q_u8(cp);
+            let v1 = vld1q_u8(cp.add(16));
+            let v2 = vld1q_u8(cp.add(32));
+            let v3 = vld1q_u8(cp.add(48));
+            let w = [
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v0)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v1)),
+                vqtbl1q_s8(wt, vandq_u8(v0, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v1, low4)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v2)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v3)),
+                vqtbl1q_s8(wt, vandq_u8(v2, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v3, low4)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qp = q.perm4.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), w[0]);
+                b = sdot(b, vld1q_s8(qp.add(16)), w[1]);
+                a = sdot(a, vld1q_s8(qp.add(32)), w[2]);
+                b = sdot(b, vld1q_s8(qp.add(48)), w[3]);
+                a = sdot(a, vld1q_s8(qp.add(64)), w[4]);
+                b = sdot(b, vld1q_s8(qp.add(80)), w[5]);
+                a = sdot(a, vld1q_s8(qp.add(96)), w[6]);
+                b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
+                *acc_qi = vaddvq_s32(vaddq_s32(a, b));
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r2_neon128`.
+    pub unsafe fn maxsim_r2_neon128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt = vld1q_s8(lut.values.as_ptr());
+        let two = vdupq_n_u8(0x03);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 32);
+            let v0 = vld1q_u8(cp);
+            let v1 = vld1q_u8(cp.add(16));
+            let w = [
+                vqtbl1q_s8(wt, vshrq_n_u8::<6>(v0)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<6>(v1)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<4>(v0), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<4>(v1), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<2>(v0), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<2>(v1), two)),
+                vqtbl1q_s8(wt, vandq_u8(v0, two)),
+                vqtbl1q_s8(wt, vandq_u8(v1, two)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qp = q.perm2.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), w[0]);
+                b = sdot(b, vld1q_s8(qp.add(16)), w[1]);
+                a = sdot(a, vld1q_s8(qp.add(32)), w[2]);
+                b = sdot(b, vld1q_s8(qp.add(48)), w[3]);
+                a = sdot(a, vld1q_s8(qp.add(64)), w[4]);
+                b = sdot(b, vld1q_s8(qp.add(80)), w[5]);
+                a = sdot(a, vld1q_s8(qp.add(96)), w[6]);
+                b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
+                *acc_qi = vaddvq_s32(vaddq_s32(a, b));
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r1_neon128`.
+    pub unsafe fn maxsim_r1_neon128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let dw = lut.values[1] as i32 - lut.values[0] as i32;
+        let w0 = lut.values[0] as i32;
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        let mut planes = [0i8; 128];
+        for (d, &cid) in cids.iter().enumerate() {
+            extract_planes_128(&codes[d * 16..d * 16 + 16], &mut planes);
+            let pp = planes.as_ptr();
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qp = q.planes.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), vld1q_s8(pp));
+                b = sdot(b, vld1q_s8(qp.add(16)), vld1q_s8(pp.add(16)));
+                a = sdot(a, vld1q_s8(qp.add(32)), vld1q_s8(pp.add(32)));
+                b = sdot(b, vld1q_s8(qp.add(48)), vld1q_s8(pp.add(48)));
+                a = sdot(a, vld1q_s8(qp.add(64)), vld1q_s8(pp.add(64)));
+                b = sdot(b, vld1q_s8(qp.add(80)), vld1q_s8(pp.add(80)));
+                a = sdot(a, vld1q_s8(qp.add(96)), vld1q_s8(pp.add(96)));
+                b = sdot(b, vld1q_s8(qp.add(112)), vld1q_s8(pp.add(112)));
+                let p = vaddvq_s32(vaddq_s32(a, b));
+                *acc_qi = dw * p + w0 * q.sums[qi];
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
+
+    // -----------------------------------------------------------------------
     // Rung 5 (aarch64 + i8mm, dim = 128): SMMLA. One idea on top of rung 4.
     //
     // SDOT does 16 MACs per instruction (four 4-wide dot products). SMMLA does
@@ -923,6 +1105,37 @@ mod x86 {
         0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04,
         0x02, 0x01,
     ];
+
+    /// The residual family's float fold, vectorized across query rows — the
+    /// AVX2 twin of `neon::fold_block` (eight rows per `_mm256_max_ps` here).
+    /// See that helper for the bit-exactness contract; the same holds:
+    /// `_mm256_cvtepi32_ps` matches `acc as f32`, the multiply and add stay
+    /// separate (no FMA), and `_mm256_max_ps` matches the scalar select for
+    /// finite scores.
+    ///
+    /// # Safety
+    /// Requires `avx2`. `accs`, `sqw`, `best` share length; `crow` is valid for
+    /// that length.
+    #[target_feature(enable = "avx2")]
+    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, best: &mut [f32]) {
+        let nq = accs.len();
+        let mut i = 0;
+        while i + 8 <= nq {
+            let a = _mm256_cvtepi32_ps(_mm256_loadu_si256(accs.as_ptr().add(i) as *const __m256i));
+            let sw = _mm256_loadu_ps(sqw.as_ptr().add(i));
+            let s = _mm256_add_ps(_mm256_mul_ps(sw, a), _mm256_loadu_ps(crow.add(i)));
+            let b = _mm256_loadu_ps(best.as_ptr().add(i));
+            _mm256_storeu_ps(best.as_mut_ptr().add(i), _mm256_max_ps(b, s));
+            i += 8;
+        }
+        while i < nq {
+            let s = sqw[i] * accs[i] as f32 + *crow.add(i);
+            if s > best[i] {
+                best[i] = s;
+            }
+            i += 1;
+        }
+    }
 
     /// # Safety
     /// Requires `avx2`; `q.biased` must be populated (dim == 128) and
@@ -1202,6 +1415,174 @@ mod x86 {
         }
         best.iter().sum()
     }
+
+    // -----------------------------------------------------------------------
+    // Fold-vectorized twins (see the NEON block's comment). Same shufb/SAD
+    // compute; each token's per-row accs land in a scratch buffer, then
+    // `fold_block` folds eight rows per `_mm256_max_ps`.
+
+    /// # Safety
+    /// As `maxsim_r4_avx2_128`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn maxsim_r4_avx2_128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.values.as_ptr() as *const __m128i));
+        let low4 = _mm256_set1_epi8(0x0F);
+        let ones = _mm256_set1_epi16(1);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = _mm256_loadu_si256(cp as *const __m256i);
+            let v1 = _mm256_loadu_si256(cp.add(32) as *const __m256i);
+            let w = [
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v0, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v0, low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v1, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v1, low4)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qs = q.perm4.as_ptr().add(qi * 128);
+                let qa = q.absq4.as_ptr().add(qi * 128);
+                let mut acc = _mm256_setzero_si256();
+                for (g, &wg) in w.iter().enumerate() {
+                    let sign_src = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                    let mag = _mm256_loadu_si256(qa.add(g * 32) as *const __m256i);
+                    let ws = _mm256_sign_epi8(wg, sign_src);
+                    let p16 = _mm256_maddubs_epi16(mag, ws);
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
+                }
+                let x =
+                    _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+                let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+                let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
+                *acc_qi = _mm_cvtsi128_si32(x);
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r2_avx2_128`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn maxsim_r2_avx2_128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.values.as_ptr() as *const __m128i));
+        let two = _mm256_set1_epi8(0x03);
+        let ones = _mm256_set1_epi16(1);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 32);
+            let v = _mm256_loadu_si256(cp as *const __m256i);
+            let w = [
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 6), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 4), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 2), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v, two)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qs = q.perm2.as_ptr().add(qi * 128);
+                let qa = q.absq2.as_ptr().add(qi * 128);
+                let mut acc = _mm256_setzero_si256();
+                for (g, &wg) in w.iter().enumerate() {
+                    let sign_src = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                    let mag = _mm256_loadu_si256(qa.add(g * 32) as *const __m256i);
+                    let ws = _mm256_sign_epi8(wg, sign_src);
+                    let p16 = _mm256_maddubs_epi16(mag, ws);
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
+                }
+                let x =
+                    _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+                let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+                let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
+                *acc_qi = _mm_cvtsi128_si32(x);
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r1_avx2_128`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn maxsim_r1_avx2_128_vfold(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let dw = lut.values[1] as i32 - lut.values[0] as i32;
+        let w0 = lut.values[0] as i32;
+        let idx = _mm256_loadu_si256(IDX.as_ptr() as *const __m256i);
+        let sel = _mm256_loadu_si256(SEL.as_ptr() as *const __m256i);
+        let zero = _mm256_setzero_si256();
+
+        macro_rules! mask32 {
+            ($bp:expr, $g:expr) => {{
+                let w = ($bp.add($g * 4) as *const u32).read_unaligned();
+                let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(w as i32), idx);
+                _mm256_cmpeq_epi8(_mm256_and_si256(bytes, sel), sel)
+            }};
+        }
+
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        let qp = q.biased.as_ptr();
+        for (d, &cid) in cids.iter().enumerate() {
+            let bp = codes.as_ptr().add(d * 16);
+            let m0 = mask32!(bp, 0);
+            let m1 = mask32!(bp, 1);
+            let m2 = mask32!(bp, 2);
+            let m3 = mask32!(bp, 3);
+            let cnt = ((bp as *const u64).read_unaligned().count_ones()
+                + (bp.add(8) as *const u64).read_unaligned().count_ones())
+                as i32;
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let q0 = qp.add(qi * 128);
+                let s0 =
+                    _mm256_sad_epu8(_mm256_and_si256(m0, _mm256_loadu_si256(q0 as *const __m256i)), zero);
+                let s1 = _mm256_sad_epu8(
+                    _mm256_and_si256(m1, _mm256_loadu_si256(q0.add(32) as *const __m256i)),
+                    zero,
+                );
+                let s2 = _mm256_sad_epu8(
+                    _mm256_and_si256(m2, _mm256_loadu_si256(q0.add(64) as *const __m256i)),
+                    zero,
+                );
+                let s3 = _mm256_sad_epu8(
+                    _mm256_and_si256(m3, _mm256_loadu_si256(q0.add(96) as *const __m256i)),
+                    zero,
+                );
+                let s = _mm256_add_epi64(_mm256_add_epi64(s0, s1), _mm256_add_epi64(s2, s3));
+                let x = _mm_add_epi64(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
+                let sad = _mm_cvtsi128_si64(_mm_add_epi64(x, _mm_unpackhi_epi64(x, x))) as i32;
+                *acc_qi = dw * (sad - 128 * cnt) + w0 * q.sums[qi];
+            }
+            fold_block(&accs, &sqw, cdot_t.as_ptr().add(cid as usize * nq), &mut best);
+        }
+        best.iter().sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,7 +1647,17 @@ pub fn maxsim_avx2(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
 
 /// Fused residual-4 MaxSim over one doc: dispatched (NEON tbl+sdot / AVX2
 /// pshufb+psignb where available, scalar reference otherwise).
+///
+/// Ships the vectorized-fold kernel: measured ~2.1× over the scalar-fold twin
+/// on the Apple M4, bit-identical, and — unlike the SMMLA decision — the win
+/// (a branch-free acc pass plus a 4/8-wide `max`) is not tied to one
+/// instruction's issue rate, so it carries across microarchitectures. CI's
+/// bench confirms the AVX2/Neoverse numbers; the scalar-fold rung stays
+/// exposed as `maxsim_r4_fused` for the head-to-head.
 pub fn maxsim_r4(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r4_vfold_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r4_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1294,8 +1685,12 @@ pub fn maxsim_r4_fused(
     None
 }
 
-/// Fused residual-2 MaxSim over one doc: dispatched exactly like `maxsim_r4`.
+/// Fused residual-2 MaxSim over one doc: dispatched exactly like `maxsim_r4`
+/// (vectorized fold first, then the scalar-fold rung, then scalar).
 pub fn maxsim_r2(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r2_vfold_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r2_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1322,8 +1717,12 @@ pub fn maxsim_r2_fused(
     None
 }
 
-/// Fused residual-1 MaxSim over one doc: dispatched exactly like `maxsim_r4`.
+/// Fused residual-1 MaxSim over one doc: dispatched exactly like `maxsim_r4`
+/// (vectorized fold first, then the scalar-fold rung, then scalar).
 pub fn maxsim_r1(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r1_vfold_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r1_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1348,6 +1747,72 @@ pub fn maxsim_r1_fused(
     #[cfg(target_arch = "x86_64")]
     if q.dim == 128 && !q.biased.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
         return Some(unsafe { x86::maxsim_r1_avx2_128(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+// The vectorized-fold twins of the three `*_fused` accessors above. Same
+// dispatch gates; they route to the `*_vfold` kernels so the bench can time
+// them head-to-head and the parity test can pin them bit-identical. The
+// shipping dispatchers (`maxsim_r{4,2,1}`) point at whichever the measurement
+// on this crate's CI platforms favored — see kernels/README.
+
+/// The fold-vectorized fused residual-4 kernel, if this CPU has it.
+#[allow(unused_variables)]
+pub fn maxsim_r4_vfold_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r4_neon128_vfold(q, lut, codes, cids, cdot_t) });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
+        return Some(unsafe { x86::maxsim_r4_avx2_128_vfold(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The fold-vectorized fused residual-2 kernel, if this CPU has it.
+#[allow(unused_variables)]
+pub fn maxsim_r2_vfold_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.perm2.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r2_neon128_vfold(q, lut, codes, cids, cdot_t) });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128 && !q.perm2.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
+        return Some(unsafe { x86::maxsim_r2_avx2_128_vfold(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The fold-vectorized fused residual-1 kernel, if this CPU has it.
+#[allow(unused_variables)]
+pub fn maxsim_r1_vfold_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.planes.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r1_neon128_vfold(q, lut, codes, cids, cdot_t) });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128 && !q.biased.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
+        return Some(unsafe { x86::maxsim_r1_avx2_128_vfold(q, lut, codes, cids, cdot_t) });
     }
     None
 }
@@ -1439,19 +1904,21 @@ mod tests {
 
     type RKernel = fn(&QueryI8, &LutI8, &[u8], &[u32], &[f32]) -> f32;
     type RFused = fn(&QueryI8, &LutI8, &[u8], &[u32], &[f32]) -> Option<f32>;
-    const R_FAMILY: [(usize, RKernel, RKernel, RFused); 3] = [
-        (4, maxsim_r4_scalar, maxsim_r4, maxsim_r4_fused),
-        (2, maxsim_r2_scalar, maxsim_r2, maxsim_r2_fused),
-        (1, maxsim_r1_scalar, maxsim_r1, maxsim_r1_fused),
+    // (nbits, scalar reference, dispatcher, scalar-fold fused, vfold fused)
+    const R_FAMILY: [(usize, RKernel, RKernel, RFused, RFused); 3] = [
+        (4, maxsim_r4_scalar, maxsim_r4, maxsim_r4_fused, maxsim_r4_vfold_fused),
+        (2, maxsim_r2_scalar, maxsim_r2, maxsim_r2_fused, maxsim_r2_vfold_fused),
+        (1, maxsim_r1_scalar, maxsim_r1, maxsim_r1_fused, maxsim_r1_vfold_fused),
     ];
 
     #[test]
     fn residual_rungs_agree_exactly() {
-        // Scalar reference, dispatcher, and whichever fused kernel this CPU
-        // has must return bit-identical floats — the f32 op order per
-        // (query row, token) is part of the spec. Same contract for every
-        // nbits rung.
-        for &(nbits, scalar, dispatched, fused) in &R_FAMILY {
+        // Scalar reference, dispatcher, and BOTH fused folds (scalar-fold and
+        // vectorized-fold) must return bit-identical floats — the f32 op order
+        // per (query row, token) is part of the spec, and the vfold helper is
+        // built to preserve it (separate mul+add, not FMA; vector max == the
+        // scalar select for finite scores). Same contract for every nbits rung.
+        for &(nbits, scalar, dispatched, fused, vfold) in &R_FAMILY {
             for &(nq, nd) in &[(32, 80), (7, 3), (1, 1)] {
                 let (q, lut, codes, cids, cdot_t) = setup_r(nq, nd, 128, 16, nbits, 99 + nd as u64);
                 let a = scalar(&q, &lut, &codes, &cids, &cdot_t);
@@ -1463,10 +1930,14 @@ mod tests {
                 if let Some(v) = fused(&q, &lut, &codes, &cids, &cdot_t) {
                     assert_eq!(a, v, "fused (nbits={nbits}, {nq},{nd})");
                 }
+                if let Some(v) = vfold(&q, &lut, &codes, &cids, &cdot_t) {
+                    assert_eq!(a, v, "vfold (nbits={nbits}, {nq},{nd})");
+                }
             }
             // Non-128 dims must fall back to the scalar rung, not crash.
             let (q, lut, codes, cids, cdot_t) = setup_r(3, 5, 64, 8, nbits, 7);
             assert!(fused(&q, &lut, &codes, &cids, &cdot_t).is_none());
+            assert!(vfold(&q, &lut, &codes, &cids, &cdot_t).is_none());
             assert_eq!(
                 dispatched(&q, &lut, &codes, &cids, &cdot_t),
                 scalar(&q, &lut, &codes, &cids, &cdot_t)
@@ -1487,7 +1958,7 @@ mod tests {
         // Dequantize everything (query rows, LUT weights) and recompute each
         // rung's score with a transparent float loop; only f32 association
         // error may separate them.
-        for &(nbits, _, dispatched, _) in &R_FAMILY {
+        for &(nbits, _, dispatched, _, _) in &R_FAMILY {
             let (nq, nd, dim, k) = (8, 20, 128, 16);
             let (q8, lut, codes, cids, cdot_t) = setup_r(nq, nd, dim, k, nbits, 5);
             let fast = dispatched(&q8, &lut, &codes, &cids, &cdot_t);
