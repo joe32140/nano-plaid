@@ -956,6 +956,108 @@ mod neon {
     }
 
     // -----------------------------------------------------------------------
+    // Experiment: attack the LAST cost the vfold rung leaves behind — the
+    // per-row horizontal reduce. `maxsim_r4_neon128_vfold` still ends each
+    // query row with `vaddvq_s32` (collapse an int32x4 to a scalar), stores
+    // that scalar to `accs[]`, then reloads it in `fold_block`. Both the
+    // scalar round-trip and the four separate reduces are avoidable.
+    //
+    // Process rows in blocks of 4. Each row's 8 SDOTs still produce an
+    // int32x4 of partial sums; instead of reducing each separately, a 4×4
+    // transpose-reduce — three `vpaddq_s32` — lands the four rows' full dot
+    // products in the four lanes of ONE vector, `[Σr0, Σr1, Σr2, Σr3]`. That
+    // vector feeds the float fold directly (no `accs[]` buffer, no reload).
+    // Integer addition is associative and exact here (|acc| ≤ 128·127·127 <
+    // 2^24), so the sum is order-independent and this stays bit-identical to
+    // the scalar `vaddvq` path — the parity test pins it. The `nq % 4` tail
+    // rows take the vfold rung's scalar reduce. This is the pragmatic 80% of
+    // the SMMLA-style "make the reduce free" idea without a new query layout.
+    //
+    // MEASURED, and it's a negative result: 2.16 vs the vfold's 2.19 µs/doc on
+    // the M4 — a ~1% difference, inside the run-to-run noise. The per-row
+    // horizontal reduce was never the bottleneck; it was already hidden under
+    // the SDOT latency, and the vfold had already banked the whole win (the
+    // float FOLD was the cost, not the reduce). The lesson worth keeping: this
+    // cheap probe also rules out the expensive version — a full SMMLA-style
+    // transpose with its own query layout would make the reduce "more free"
+    // and buy the same ~nothing. Kept as a benched rung, not shipped; the
+    // dispatcher stays on vfold.
+
+    /// # Safety
+    /// As `maxsim_r4_neon128`.
+    pub unsafe fn maxsim_r4_neon128_tr(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt = vld1q_s8(lut.values.as_ptr());
+        let low4 = vdupq_n_u8(0x0F);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let nblk = nq / 4; // full 4-row blocks; the rest fall to the scalar tail
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = vld1q_u8(cp);
+            let v1 = vld1q_u8(cp.add(16));
+            let v2 = vld1q_u8(cp.add(32));
+            let v3 = vld1q_u8(cp.add(48));
+            let w = [
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v0)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v1)),
+                vqtbl1q_s8(wt, vandq_u8(v0, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v1, low4)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v2)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v3)),
+                vqtbl1q_s8(wt, vandq_u8(v2, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v3, low4)),
+            ];
+            let crow = cdot_t.as_ptr().add(cid as usize * nq);
+            // Compute one row's 128-dim dot as an int32x4 of partial sums.
+            let row_dot = |qi: usize| -> int32x4_t {
+                let qp = q.perm4.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), w[0]);
+                b = sdot(b, vld1q_s8(qp.add(16)), w[1]);
+                a = sdot(a, vld1q_s8(qp.add(32)), w[2]);
+                b = sdot(b, vld1q_s8(qp.add(48)), w[3]);
+                a = sdot(a, vld1q_s8(qp.add(64)), w[4]);
+                b = sdot(b, vld1q_s8(qp.add(80)), w[5]);
+                a = sdot(a, vld1q_s8(qp.add(96)), w[6]);
+                b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
+                vaddq_s32(a, b)
+            };
+            for blk in 0..nblk {
+                let base = blk * 4;
+                let r0 = row_dot(base);
+                let r1 = row_dot(base + 1);
+                let r2 = row_dot(base + 2);
+                let r3 = row_dot(base + 3);
+                // 4×4 transpose-reduce: lane i = Σ over row (base+i).
+                let accv = vpaddq_s32(vpaddq_s32(r0, r1), vpaddq_s32(r2, r3));
+                let af = vcvtq_f32_s32(accv);
+                let s = vaddq_f32(
+                    vmulq_f32(vld1q_f32(sqw.as_ptr().add(base)), af),
+                    vld1q_f32(crow.add(base)),
+                );
+                let bb = vld1q_f32(best.as_ptr().add(base));
+                vst1q_f32(best.as_mut_ptr().add(base), vmaxq_f32(bb, s));
+            }
+            for qi in (nblk * 4)..nq {
+                let acc = vaddvq_s32(row_dot(qi));
+                let s = sqw[qi] * acc as f32 + *crow.add(qi);
+                if s > best[qi] {
+                    best[qi] = s;
+                }
+            }
+        }
+        best.iter().sum()
+    }
+
+    // -----------------------------------------------------------------------
     // Rung 5 (aarch64 + i8mm, dim = 128): SMMLA. One idea on top of rung 4.
     //
     // SDOT does 16 MACs per instruction (four 4-wide dot products). SMMLA does
@@ -1816,6 +1918,24 @@ pub fn maxsim_r4_vfold_fused(
     None
 }
 
+/// The transpose-reduce residual-4 kernel (NEON only; experimental rung — see
+/// its comment). `None` on x86 or a non-dotprod CPU, so the bench/tests just
+/// skip it there.
+#[allow(unused_variables)]
+pub fn maxsim_r4_tr_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r4_neon128_tr(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
 /// The fold-vectorized fused residual-2 kernel, if this CPU has it.
 #[allow(unused_variables)]
 pub fn maxsim_r2_vfold_fused(
@@ -2000,6 +2120,25 @@ mod tests {
                 scalar(&q, &lut, &codes, &cids, &cdot_t)
             );
         }
+    }
+
+    #[test]
+    fn r4_transpose_reduce_agrees_exactly() {
+        // The experimental transpose-reduce rung must match the r4 scalar
+        // reference bit-for-bit — the integer sum is order-independent, so the
+        // vpaddq reduce gives the identical acc as the scalar vaddvq. Shapes
+        // cover nq % 4 ∈ {0, 3, 2, 1} to exercise the 4-row blocks AND the
+        // scalar tail that handles the leftover rows.
+        for &(nq, nd) in &[(32, 80), (7, 3), (6, 5), (5, 9), (1, 1)] {
+            let (q, lut, codes, cids, cdot_t) = setup_r(nq, nd, 128, 16, 4, 51 + nq as u64);
+            let a = maxsim_r4_scalar(&q, &lut, &codes, &cids, &cdot_t);
+            if let Some(v) = maxsim_r4_tr_fused(&q, &lut, &codes, &cids, &cdot_t) {
+                assert_eq!(a, v, "tr (nq={nq}, nd={nd})");
+            }
+        }
+        // Non-128 dims: no NEON tr kernel, must return None.
+        let (q, lut, codes, cids, cdot_t) = setup_r(4, 5, 64, 8, 4, 3);
+        assert!(maxsim_r4_tr_fused(&q, &lut, &codes, &cids, &cdot_t).is_none());
     }
 
     /// Bucket index of dim `d` in one token's packed codes (np.packbits order,
