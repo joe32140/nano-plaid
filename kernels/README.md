@@ -225,15 +225,25 @@ Each has a production answer in
    was that the per-(row, token) scalar f32 fold, or the payload bytes? Moving
    the fold into a vectorized `fold_block` (four rows per `vmaxq_f32`) made it
    ~2.1× faster with bit-identical scores, collapsing the gap to ~1.15×: the
-   fold was the cost. Third, the follow-up — *also now answered in-tree, and
-   it's a negative result.* The `_vfold` kernels still run one `vaddvq_s32`
-   horizontal reduce per row; `maxsim_r4_neon128_tr` removes it, folding four
-   rows with a `vpaddq_s32` transpose-reduce so the four dot products land in
-   one register (no scalar round-trip). Measured: **2.16 vs 2.19 µs/doc, inside
-   the noise.** The reduce was never the bottleneck — it was already hidden
-   under the SDOT latency, and the vfold had banked the whole win. The useful
-   part is what it rules out: a fuller SMMLA-style transpose (its own query
-   layout, register juggling) would make the reduce "more free" and buy the
-   same ~nothing, so it isn't worth building. The cheap probe retired the
-   expensive one. `maxsim_r4_neon128_tr` stays a benched rung; dispatch keeps
-   vfold.
+   fold was the cost. Third, the follow-up — *answered in-tree, and the answer
+   is microarchitecture-dependent, which is the real lesson.* The `_vfold`
+   kernels still run one `vaddvq_s32` horizontal reduce per row;
+   `maxsim_r4_neon128_tr` removes it, folding four rows with a `vpaddq_s32`
+   transpose-reduce so the four dot products land in one register (no scalar
+   round-trip). Bit-identical, and measured on three cores (µs/doc vs vfold):
+
+   | core | vfold | transpose-reduce | |
+   |------|------:|-----------------:|--|
+   | Apple M4 (idle local) | 2.19 | 2.16 | wash |
+   | Apple M1 (macos CI) | 3.12 | **2.81** | tr ~10% faster |
+   | Neoverse N2 (arm CI) | 5.67 | 5.66 | wash |
+
+   So whether the per-row reduce is a real cost depends on the core: the wide
+   M4 and the Neoverse N2 hide the `vaddvq` under SDOT latency; the narrower M1
+   does not, and removing it there is a genuine ~10% win. The transpose idea
+   was right — on one of three cores. This flips the "bench on more than one
+   microarchitecture" moral the OTHER way from SMMLA (negative on M4, positive
+   on Neoverse; here a wash on both of those, a win on the M1). Non-negative
+   everywhere, so the whole family ships it: `maxsim_r{4,2,1}` dispatch
+   tr → vfold → scalar on NEON (r2 shares r4's `tbl` compute; r1 applies its
+   affine `dw·P + w0·T` per lane before the shared `fold4`). x86 keeps vfold.

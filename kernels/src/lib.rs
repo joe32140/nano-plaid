@@ -539,6 +539,22 @@ mod neon {
         }
     }
 
+    /// One 4-row block of the transpose-reduce fold: `accv` already holds four
+    /// query rows' final i32 accs (lane i = row `base+i`), so this just applies
+    /// the shared float tail — same ops, same order, as `fold_block`, hence
+    /// bit-identical. Used by the `*_tr` kernels, where the four accs arrive in
+    /// one register (a `vpaddq_s32` transpose-reduce) instead of via `accs[]`.
+    #[inline(always)]
+    unsafe fn fold4(accv: int32x4_t, base: usize, sqw: &[f32], crow: *const f32, best: &mut [f32]) {
+        let af = vcvtq_f32_s32(accv);
+        let s = vaddq_f32(
+            vmulq_f32(vld1q_f32(sqw.as_ptr().add(base)), af),
+            vld1q_f32(crow.add(base)),
+        );
+        let b = vld1q_f32(best.as_ptr().add(base));
+        vst1q_f32(best.as_mut_ptr().add(base), vmaxq_f32(b, s));
+    }
+
     /// # Safety
     /// Requires `dotprod`; `q.planes` must be populated (dim == 128) and
     /// `bits.len() == n_d * 16`.
@@ -973,15 +989,22 @@ mod neon {
     // rows take the vfold rung's scalar reduce. This is the pragmatic 80% of
     // the SMMLA-style "make the reduce free" idea without a new query layout.
     //
-    // MEASURED, and it's a negative result: 2.16 vs the vfold's 2.19 µs/doc on
-    // the M4 — a ~1% difference, inside the run-to-run noise. The per-row
-    // horizontal reduce was never the bottleneck; it was already hidden under
-    // the SDOT latency, and the vfold had already banked the whole win (the
-    // float FOLD was the cost, not the reduce). The lesson worth keeping: this
-    // cheap probe also rules out the expensive version — a full SMMLA-style
-    // transpose with its own query layout would make the reduce "more free"
-    // and buy the same ~nothing. Kept as a benched rung, not shipped; the
-    // dispatcher stays on vfold.
+    // MEASURED on three cores — and the answer is microarchitecture-dependent,
+    // which is the whole lesson. Against the vfold rung (µs/doc):
+    //   Apple M4 (idle local):      2.16 vs 2.19  — a wash (~1%)
+    //   Apple M1 (macos CI):        2.81 vs 3.12  — tr ~10% FASTER
+    //   Neoverse N2 (ubuntu-arm CI): 5.66 vs 5.67 — a wash
+    // So whether the per-row horizontal reduce is a real cost depends on the
+    // core: the wide M4 and the Neoverse N2 hide the `vaddvq` under SDOT
+    // latency, but the narrower M1 does not, and removing it there is a genuine
+    // win. The transpose idea was right — on one of three cores. This flips the
+    // "bench on more than one microarchitecture" lesson the OTHER way from
+    // SMMLA (negative on M4, positive on Neoverse; here, a wash on both of
+    // those and a win on the M1). Non-negative on every core measured, so the
+    // whole family ships it: `maxsim_r{4,2,1}` dispatch tr → vfold → scalar on
+    // NEON, and `maxsim_r2/r1_neon128_tr` are the same transform (r2 shares the
+    // tbl compute; r1 applies its affine `dw·P + w0·T` per lane in integers
+    // before the shared `fold4`).
 
     /// # Safety
     /// As `maxsim_r4_neon128`.
@@ -1032,22 +1055,140 @@ mod neon {
             };
             for blk in 0..nblk {
                 let base = blk * 4;
-                let r0 = row_dot(base);
-                let r1 = row_dot(base + 1);
-                let r2 = row_dot(base + 2);
-                let r3 = row_dot(base + 3);
                 // 4×4 transpose-reduce: lane i = Σ over row (base+i).
-                let accv = vpaddq_s32(vpaddq_s32(r0, r1), vpaddq_s32(r2, r3));
-                let af = vcvtq_f32_s32(accv);
-                let s = vaddq_f32(
-                    vmulq_f32(vld1q_f32(sqw.as_ptr().add(base)), af),
-                    vld1q_f32(crow.add(base)),
+                let accv = vpaddq_s32(
+                    vpaddq_s32(row_dot(base), row_dot(base + 1)),
+                    vpaddq_s32(row_dot(base + 2), row_dot(base + 3)),
                 );
-                let bb = vld1q_f32(best.as_ptr().add(base));
-                vst1q_f32(best.as_mut_ptr().add(base), vmaxq_f32(bb, s));
+                fold4(accv, base, &sqw, crow, &mut best);
             }
             for qi in (nblk * 4)..nq {
                 let acc = vaddvq_s32(row_dot(qi));
+                let s = sqw[qi] * acc as f32 + *crow.add(qi);
+                if s > best[qi] {
+                    best[qi] = s;
+                }
+            }
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r2_neon128`.
+    pub unsafe fn maxsim_r2_neon128_tr(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt = vld1q_s8(lut.values.as_ptr());
+        let two = vdupq_n_u8(0x03);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let nblk = nq / 4;
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 32);
+            let v0 = vld1q_u8(cp);
+            let v1 = vld1q_u8(cp.add(16));
+            let w = [
+                vqtbl1q_s8(wt, vshrq_n_u8::<6>(v0)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<6>(v1)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<4>(v0), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<4>(v1), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<2>(v0), two)),
+                vqtbl1q_s8(wt, vandq_u8(vshrq_n_u8::<2>(v1), two)),
+                vqtbl1q_s8(wt, vandq_u8(v0, two)),
+                vqtbl1q_s8(wt, vandq_u8(v1, two)),
+            ];
+            let crow = cdot_t.as_ptr().add(cid as usize * nq);
+            let row_dot = |qi: usize| -> int32x4_t {
+                let qp = q.perm2.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), w[0]);
+                b = sdot(b, vld1q_s8(qp.add(16)), w[1]);
+                a = sdot(a, vld1q_s8(qp.add(32)), w[2]);
+                b = sdot(b, vld1q_s8(qp.add(48)), w[3]);
+                a = sdot(a, vld1q_s8(qp.add(64)), w[4]);
+                b = sdot(b, vld1q_s8(qp.add(80)), w[5]);
+                a = sdot(a, vld1q_s8(qp.add(96)), w[6]);
+                b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
+                vaddq_s32(a, b)
+            };
+            for blk in 0..nblk {
+                let base = blk * 4;
+                let accv = vpaddq_s32(
+                    vpaddq_s32(row_dot(base), row_dot(base + 1)),
+                    vpaddq_s32(row_dot(base + 2), row_dot(base + 3)),
+                );
+                fold4(accv, base, &sqw, crow, &mut best);
+            }
+            for qi in (nblk * 4)..nq {
+                let acc = vaddvq_s32(row_dot(qi));
+                let s = sqw[qi] * acc as f32 + *crow.add(qi);
+                if s > best[qi] {
+                    best[qi] = s;
+                }
+            }
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// As `maxsim_r1_neon128`.
+    pub unsafe fn maxsim_r1_neon128_tr(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let dw = lut.values[1] as i32 - lut.values[0] as i32;
+        let w0 = lut.values[0] as i32;
+        let dwv = vdupq_n_s32(dw);
+        let w0v = vdupq_n_s32(w0);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut planes = [0i8; 128];
+        let nblk = nq / 4;
+        for (d, &cid) in cids.iter().enumerate() {
+            extract_planes_128(&codes[d * 16..d * 16 + 16], &mut planes);
+            let pp = planes.as_ptr();
+            let crow = cdot_t.as_ptr().add(cid as usize * nq);
+            // P = q · bits for one row, as an int32x4 of partial sums.
+            let row_p = |qi: usize| -> int32x4_t {
+                let qp = q.planes.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), vld1q_s8(pp));
+                b = sdot(b, vld1q_s8(qp.add(16)), vld1q_s8(pp.add(16)));
+                a = sdot(a, vld1q_s8(qp.add(32)), vld1q_s8(pp.add(32)));
+                b = sdot(b, vld1q_s8(qp.add(48)), vld1q_s8(pp.add(48)));
+                a = sdot(a, vld1q_s8(qp.add(64)), vld1q_s8(pp.add(64)));
+                b = sdot(b, vld1q_s8(qp.add(80)), vld1q_s8(pp.add(80)));
+                a = sdot(a, vld1q_s8(qp.add(96)), vld1q_s8(pp.add(96)));
+                b = sdot(b, vld1q_s8(qp.add(112)), vld1q_s8(pp.add(112)));
+                vaddq_s32(a, b)
+            };
+            for blk in 0..nblk {
+                let base = blk * 4;
+                // [P0..P3] via the transpose-reduce, then the affine
+                // `acc = dw·P + w0·T` applied per lane in integers — same i32
+                // result as the scalar `dw * p + w0 * sums[qi]`.
+                let pv = vpaddq_s32(
+                    vpaddq_s32(row_p(base), row_p(base + 1)),
+                    vpaddq_s32(row_p(base + 2), row_p(base + 3)),
+                );
+                let sumsv = vld1q_s32(q.sums.as_ptr().add(base));
+                let accv = vaddq_s32(vmulq_s32(dwv, pv), vmulq_s32(w0v, sumsv));
+                fold4(accv, base, &sqw, crow, &mut best);
+            }
+            for qi in (nblk * 4)..nq {
+                let p = vaddvq_s32(row_p(qi));
+                let acc = dw * p + w0 * q.sums[qi];
                 let s = sqw[qi] * acc as f32 + *crow.add(qi);
                 if s > best[qi] {
                     best[qi] = s;
@@ -1789,13 +1930,17 @@ pub fn maxsim_avx2(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
 /// Fused residual-4 MaxSim over one doc: dispatched (NEON tbl+sdot / AVX2
 /// pshufb+psignb where available, scalar reference otherwise).
 ///
-/// Ships the vectorized-fold kernel: measured ~2.1× over the scalar-fold twin
-/// on the Apple M4, bit-identical, and — unlike the SMMLA decision — the win
-/// (a branch-free acc pass plus a 4/8-wide `max`) is not tied to one
-/// instruction's issue rate, so it carries across microarchitectures. CI's
-/// bench confirms the AVX2/Neoverse numbers; the scalar-fold rung stays
-/// exposed as `maxsim_r4_fused` for the head-to-head.
+/// Ships the transpose-reduce kernel on NEON, else the vectorized-fold kernel.
+/// The vfold was measured ~2.1× over the scalar-fold twin (the branch-free acc
+/// pass + wide `max`, transferable across cores); the tr rung then folds four
+/// rows with one `vpaddq` reduce and is non-negative on every core measured
+/// (+10% on the M1, a wash on M4/Neoverse), so NEON prefers it. All three are
+/// bit-identical; `maxsim_r4_fused`/`_vfold_fused`/`_tr_fused` stay exposed for
+/// the head-to-head bench.
 pub fn maxsim_r4(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r4_tr_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r4_vfold_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1827,8 +1972,11 @@ pub fn maxsim_r4_fused(
 }
 
 /// Fused residual-2 MaxSim over one doc: dispatched exactly like `maxsim_r4`
-/// (vectorized fold first, then the scalar-fold rung, then scalar).
+/// (transpose-reduce on NEON, then vfold, then scalar-fold, then scalar).
 pub fn maxsim_r2(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r2_tr_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r2_vfold_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1859,8 +2007,11 @@ pub fn maxsim_r2_fused(
 }
 
 /// Fused residual-1 MaxSim over one doc: dispatched exactly like `maxsim_r4`
-/// (vectorized fold first, then the scalar-fold rung, then scalar).
+/// (transpose-reduce on NEON, then vfold, then scalar-fold, then scalar).
 pub fn maxsim_r1(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r1_tr_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r1_vfold_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1918,9 +2069,8 @@ pub fn maxsim_r4_vfold_fused(
     None
 }
 
-/// The transpose-reduce residual-4 kernel (NEON only; experimental rung — see
-/// its comment). `None` on x86 or a non-dotprod CPU, so the bench/tests just
-/// skip it there.
+/// The transpose-reduce residual-4 kernel (NEON only — see its comment). `None`
+/// on x86 or a non-dotprod CPU, where the dispatcher falls through to vfold.
 #[allow(unused_variables)]
 pub fn maxsim_r4_tr_fused(
     q: &QueryI8,
@@ -1932,6 +2082,38 @@ pub fn maxsim_r4_tr_fused(
     #[cfg(target_arch = "aarch64")]
     if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
         return Some(unsafe { neon::maxsim_r4_neon128_tr(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The transpose-reduce residual-2 kernel (NEON only). `None` elsewhere.
+#[allow(unused_variables)]
+pub fn maxsim_r2_tr_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.perm2.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r2_neon128_tr(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The transpose-reduce residual-1 kernel (NEON only). `None` elsewhere.
+#[allow(unused_variables)]
+pub fn maxsim_r1_tr_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.planes.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r1_neon128_tr(q, lut, codes, cids, cdot_t) });
     }
     None
 }
@@ -2123,22 +2305,31 @@ mod tests {
     }
 
     #[test]
-    fn r4_transpose_reduce_agrees_exactly() {
-        // The experimental transpose-reduce rung must match the r4 scalar
-        // reference bit-for-bit — the integer sum is order-independent, so the
-        // vpaddq reduce gives the identical acc as the scalar vaddvq. Shapes
-        // cover nq % 4 ∈ {0, 3, 2, 1} to exercise the 4-row blocks AND the
-        // scalar tail that handles the leftover rows.
-        for &(nq, nd) in &[(32, 80), (7, 3), (6, 5), (5, 9), (1, 1)] {
-            let (q, lut, codes, cids, cdot_t) = setup_r(nq, nd, 128, 16, 4, 51 + nq as u64);
-            let a = maxsim_r4_scalar(&q, &lut, &codes, &cids, &cdot_t);
-            if let Some(v) = maxsim_r4_tr_fused(&q, &lut, &codes, &cids, &cdot_t) {
-                assert_eq!(a, v, "tr (nq={nq}, nd={nd})");
+    fn transpose_reduce_rungs_agree_exactly() {
+        // Every transpose-reduce rung must match its nbits scalar reference
+        // bit-for-bit — integer sums are order-independent, so the vpaddq
+        // reduce gives the identical acc as the scalar vaddvq (and r1's affine
+        // `dw·P + w0·T` is the same in i32 lanes as the scalar). Shapes cover
+        // nq % 4 ∈ {0, 3, 2, 1} to exercise the 4-row blocks AND the scalar
+        // tail; nbits ∈ {4, 2, 1} covers the whole shipped family.
+        type Tr = fn(&QueryI8, &LutI8, &[u8], &[u32], &[f32]) -> Option<f32>;
+        let family: [(usize, RKernel, Tr); 3] = [
+            (4, maxsim_r4_scalar, maxsim_r4_tr_fused),
+            (2, maxsim_r2_scalar, maxsim_r2_tr_fused),
+            (1, maxsim_r1_scalar, maxsim_r1_tr_fused),
+        ];
+        for &(nbits, scalar, tr) in &family {
+            for &(nq, nd) in &[(32, 80), (7, 3), (6, 5), (5, 9), (1, 1)] {
+                let (q, lut, codes, cids, cdot_t) = setup_r(nq, nd, 128, 16, nbits, 51 + nq as u64);
+                let a = scalar(&q, &lut, &codes, &cids, &cdot_t);
+                if let Some(v) = tr(&q, &lut, &codes, &cids, &cdot_t) {
+                    assert_eq!(a, v, "tr (nbits={nbits}, nq={nq}, nd={nd})");
+                }
             }
+            // Non-128 dims: no NEON tr kernel, must return None.
+            let (q, lut, codes, cids, cdot_t) = setup_r(4, 5, 64, 8, nbits, 3);
+            assert!(tr(&q, &lut, &codes, &cids, &cdot_t).is_none());
         }
-        // Non-128 dims: no NEON tr kernel, must return None.
-        let (q, lut, codes, cids, cdot_t) = setup_r(4, 5, 64, 8, 4, 3);
-        assert!(maxsim_r4_tr_fused(&q, &lut, &codes, &cids, &cdot_t).is_none());
     }
 
     /// Bucket index of dim `d` in one token's packed codes (np.packbits order,

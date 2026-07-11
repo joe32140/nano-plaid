@@ -246,17 +246,25 @@ fn main() {
         }
     }
 
-    // Experimental r4 rung: the transpose-reduce fold (NEON only). Timed
-    // against r4's vfold above — does eliminating the per-row horizontal
-    // reduce actually help, or was it already hidden under the SDOTs?
-    if maxsim_r4_tr_fused(&q, &lut, &r4_codes[0], &r4_cids[0], &cdot_t).is_some() {
-        let t = best_of(|| {
-            r4_codes
-                .iter()
-                .zip(&r4_cids)
-                .map(|(c, ids)| maxsim_r4_tr_fused(&q, &lut, c, ids, &cdot_t).unwrap())
-                .sum()
-        });
-        line("r4      + transpose-reduce", t);
+    // The transpose-reduce fold (NEON only), timed against each rung's vfold
+    // above — does eliminating the per-row horizontal reduce help? The answer
+    // is microarchitecture-dependent (a wash on M4/Neoverse, ~10% on the M1),
+    // so the family ships it on NEON; the bench prints it to keep the receipt.
+    macro_rules! time_tr {
+        ($codes:expr, $tr:path, $label:expr) => {
+            if $tr(&q, &lut, &$codes[0], &r4_cids[0], &cdot_t).is_some() {
+                let t = best_of(|| {
+                    $codes
+                        .iter()
+                        .zip(&r4_cids)
+                        .map(|(c, ids)| $tr(&q, &lut, c, ids, &cdot_t).unwrap())
+                        .sum()
+                });
+                line($label, t);
+            }
+        };
     }
+    time_tr!(r4_codes, maxsim_r4_tr_fused, "r4      + transpose-reduce");
+    time_tr!(r2_codes, maxsim_r2_tr_fused, "r2      + transpose-reduce");
+    time_tr!(r1_codes, maxsim_r1_tr_fused, "r1      + transpose-reduce");
 }
