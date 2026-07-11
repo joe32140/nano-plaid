@@ -77,6 +77,19 @@
     border:1px solid var(--line);margin-top:10px;color:var(--muted)}
   .bits-card .status.done{border-color:#2f5e3c;color:var(--ok)}
   .bits-card .status.ex{border-color:#7a5a2c;color:var(--ch-a)}
+
+  /* amortization meter (ch 09) */
+  .amort{display:grid;gap:12px;margin-top:16px}
+  .amort-row{display:grid;grid-template-columns:minmax(110px,150px) 1fr minmax(150px,190px);gap:12px;align-items:center}
+  .amort-row .lbl{font-family:var(--mono);font-size:12.5px;color:var(--muted);text-align:right}
+  .amort-row .lbl small{display:block;color:var(--faint);font-size:11px}
+  .amort-row .track{height:26px;background:#0b111c;border:1px solid var(--line);border-radius:6px;overflow:hidden;display:flex}
+  .amort-row .seg{height:100%;transition:width .45s cubic-bezier(.2,.8,.2,1)}
+  .amort-row .seg.ex{background:linear-gradient(90deg,#7a5a2c,var(--ch-a))}
+  .amort-row .seg.sc{background:linear-gradient(90deg,#31537a,var(--ch-b))}
+  .amort-row .val{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .amort-legend{display:flex;flex-direction:column;gap:6px;font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:12px}
+  .amort-legend .sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:6px}
 </style>
 </head>
 <body>
@@ -113,8 +126,9 @@
       <li><a href="#r6"><span class="n">06</span> tbl: 16 lookups, 1 instruction</a></li>
       <li><a href="#r7"><span class="n">07</span> The kernel: fusion, again</a></li>
       <li><a href="#r8"><span class="n">08</span> Measured, three ways</a></li>
-      <li><a href="#r9"><span class="n">09</span> Does it cover 1, 2, and 4 bits?</a></li>
-      <li><a href="#r10"><span class="n">10</span> Check yourself</a></li>
+      <li><a href="#r9"><span class="n">09</span> Why 4, 2, 1 bits cost the same</a></li>
+      <li><a href="#r10"><span class="n">10</span> Does it cover 1, 2, and 4 bits?</a></li>
+      <li><a href="#r11"><span class="n">11</span> Check yourself</a></li>
     </ol>
   </nav>
 </header>
@@ -394,9 +408,73 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   results.</p>
 </section>
 
-<!-- ═══ 09 COVERAGE ═══ -->
+<!-- ═══ 09 THE FLAT LINE ═══ -->
 <section id="r9">
-  <span class="eyebrow">09 · scope, honestly</span>
+  <span class="eyebrow">09 · the flat line</span>
+  <h2>Why 4, 2, and 1 bits all cost the same</h2>
+  <p class="lede">The fused family measures <b>4.55 / 4.54 / 5.52 µs per doc</b> (M4) while
+  streaming <b>64 / 32 / 16 bytes</b> of codes per token. Three payload sizes, one speed — and
+  the <em>smallest</em> payload is the <em>slowest</em>. If bytes set the pace, residual-1
+  would be 4× faster than residual-4. It isn't, and the reason is the most instructive thing
+  this kernel has to say.</p>
+
+  <p><strong>Fusion changed which resource is scarce.</strong> The decode → GEMM baseline is
+  memory-bound (class 02, chapter 06): every token round-trips through a float buffer, so time
+  is proportional to bytes moved — and sure enough, the numpy baselines order exactly by
+  nbits. The fused kernels don't:</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>full-SciFact p50</th><th>residual-4</th><th>residual-2</th><th>residual-1</th><th>regime</th></tr>
+      <tr><td class="mono">numpy decode → GEMM</td><td class="mono">111 ms</td><td class="mono">82 ms</td><td class="mono">64 ms</td><td>memory-bound → <b>time ∝ bytes</b></td></tr>
+      <tr><td class="mono">fused LUT kernel</td><td class="mono">7.9 ms</td><td class="mono">8.0 ms</td><td class="mono">8.9 ms</td><td>compute-bound → <b>time ∝ instructions</b></td></tr>
+    </table>
+  </div>
+
+  <p>The fused kernel expands a token's codes into registers and never writes them back; the
+  expanded bytes are then reused by <em>every query row</em>. That kills the memory traffic
+  that made bytes matter. What's left is an instruction count — and it has two very unequal
+  parts. The <b>expand</b> (unpack codes, look up weights) is the <em>only</em> part nbits
+  changes, and it runs <b>once per doc token</b>. The <b>score core</b> (8 SDOTs, the float
+  fold, the max) is identical for every nbits — expansion normalized everything to the same
+  128 weight bytes — and it runs <b>once per query row</b>, i.e. ~32× more often. Drag the
+  slider:</p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">the amortization meter — work per doc token (illustrative NEON instruction counts)</span>
+    </div>
+    <div class="sliderline"><span>query rows scored against this doc token:</span>
+      <input type="range" id="amSlider" min="1" max="32" value="1" aria-label="query rows scored per doc token">
+      <span>nq = <b id="amNq">1</b></span></div>
+    <div class="amort" id="amArea"></div>
+    <div class="amort-legend">
+      <span><span class="sw" style="background:var(--ch-a)"></span>expand codes → 128 weight bytes · once per doc token · the only nbits-dependent work</span>
+      <span><span class="sw" style="background:var(--ch-b)"></span>score core: 8 SDOTs + float fold + max · once per <em>query row</em> · identical for every nbits</span>
+    </div>
+    <p class="note" id="amNote"></p>
+  </div>
+
+  <p>That's the whole explanation: <b>nbits only changes work that is charged once per doc
+  token, and the kernel amortizes that charge over all 32 query rows.</b> At real query sizes
+  the nbits-dependent slice is ~5% of the instructions, so 64-byte and 16-byte codes finish
+  within noise of each other. The model also predicts the two apparent exceptions. Binary's
+  1.89 µs is <em>not</em> "fewer bytes" either — it has the same amortization but a cheaper
+  core: no centroid term, so its max stays integer and it skips the per-row float fold
+  (chapter 07). And residual-1 lands slowest on ARM yet fastest-residual on AVX2 because its
+  expand and fold differ in <em>kind</em>, not in bytes — on x86 its affine form rides the
+  cheap masked-SAD path. Once bytes stop explaining the time, microarchitecture is all that's
+  left.</p>
+
+  <p class="note">Bytes still matter where memory is genuinely the scarce resource: the
+  resident index (85 / 47 / 28 MB), and they would matter again if the working set outgrew
+  cache and streaming bandwidth re-entered. The claim is not "bytes never matter" — it's that
+  this loop, after fusion, no longer pays for them.</p>
+</section>
+
+<!-- ═══ 10 COVERAGE ═══ -->
+<section id="r10">
+  <span class="eyebrow">10 · scope, honestly</span>
   <h2>Does it cover 1, 2, and 4 bits?</h2>
   <p class="lede">The <em>identity</em> covers all three — chapter 05 is the proof. The
   <em>kernels</em> stand today like this:</p>
@@ -419,20 +497,21 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   specialized form is <em>better</em> than running it through the general kernel — with only
   two weights the "lookup" degenerates to the mask class 03 already built, there's no centroid
   term, and the max stays in integers. The general identity tells you why the special case was
-  possible; it doesn't replace it. <strong>Second</strong>, residual-2 is deliberately an
-  exercise: everything transfers (4-entry table fits in the same register sixteen times over),
-  only the nibble-unpack changes — and its quality column (0.7340, <em>below</em> binary at
-  1.8× the bytes) makes you ask whether it earns a kernel at all. That question — not the
-  SIMD — is the exercise. <strong>Third</strong>, the pattern is the same one that produced
+  possible; it doesn't replace it. <strong>Second</strong>, residual-2 transferred exactly as
+  the identity predicted (its 4-entry table fits the same register sixteen times over; only
+  the unpack changes) and measured 82 → 8.0 ms — but chapter 09's flat line means speed is no
+  longer an argument for it: its only remaining edge over residual-4 is index size (47 vs
+  85 MB), and its quality column (0.7340, <em>below</em> binary at 1.8× the bytes) makes you
+  ask whether that earns it a slot. <strong>Third</strong>, the pattern is the same one that produced
   class 03: find the identity, quantize the operands, fuse the loop, measure on every
   platform. next-plaid's residual rescore is still <code>decompress → GEMM</code>; this kernel
   is the port candidate.</p>
 </section>
 
-<!-- ═══ 10 QUIZ ═══ -->
-<section id="r10">
-  <span class="eyebrow">10 · check yourself</span>
-  <h2>Six questions</h2>
+<!-- ═══ 11 QUIZ ═══ -->
+<section id="r11">
+  <span class="eyebrow">11 · check yourself</span>
+  <h2>Seven questions</h2>
   <p class="lede">Instant feedback, explanations included. Miss one? The chapter number is next
   to it.</p>
   <div id="quiz"></div>
@@ -560,7 +639,7 @@ const CDOT=0.4183;
      note:"the mask IS the lookup; max stays integer"},
     {bits:2,name:"residual-2",table:"4 entries",bpt:"32 + 4 B",ndcg:"0.7340",
      idn:"Σ w·S over 4 buckets",
-     status:["done","✅ measured — see ch 09"],
+     status:["done","✅ measured — see ch 09–10"],
      note:"same tbl, cheaper unpack — but read its NDCG first"},
     {bits:4,name:"residual-4",table:"16 entries",bpt:"64 + 4 B",ndcg:"0.7567",
      idn:"Σ w·S over 16 buckets + centroid",
@@ -647,7 +726,51 @@ const CDOT=0.4183;
   });
 })();
 
-/* ── 10: quiz ───────────────────────────────────────────────────────── */
+/* ── 09: amortization meter ─────────────────────────────────────────── */
+(function(){
+  // illustrative NEON instruction counts per doc token (see kernels/src/lib.rs):
+  //   expand r4: 4 loads + 4 shifts + 4 masks + 8 tbl            ≈ 20
+  //   expand r2: 2 loads + 8 shifts + 8 masks + 8 tbl            ≈ 26
+  //   expand r1: 1 load  + plane expansion (extract_planes_128)  ≈ 24
+  //   score core per query row: 8 sdot + reduce + f32 fold + max ≈ 13
+  const SCHEMES=[
+    {name:"residual-4",sub:"64 B codes",ex:20},
+    {name:"residual-2",sub:"32 B codes",ex:26},
+    {name:"residual-1",sub:"16 B codes",ex:24},
+  ];
+  const PER_ROW=13;
+  const area=$("amArea");
+  SCHEMES.forEach(s=>{
+    const row=mk("div","amort-row");
+    const lbl=mk("div","lbl");lbl.innerHTML=s.name+"<small>"+s.sub+"</small>";
+    const track=mk("div","track");
+    track.append(mk("div","seg ex"),mk("div","seg sc"));
+    row.append(lbl,track,mk("div","val"));
+    area.append(row);
+  });
+  const rows=[...area.children];
+  const maxTot=Math.max(...SCHEMES.map(s=>s.ex))+32*PER_ROW; // fixed scale across the drag
+  function upd(){
+    const nq=+$("amSlider").value;
+    $("amNq").textContent=nq;
+    SCHEMES.forEach((s,i)=>{
+      const sc=nq*PER_ROW,tot=s.ex+sc;
+      rows[i].querySelector(".seg.ex").style.width=(s.ex/maxTot*100)+"%";
+      rows[i].querySelector(".seg.sc").style.width=(sc/maxTot*100)+"%";
+      rows[i].querySelector(".val").innerHTML="<b>"+tot+"</b> instr · nbits-dep <b>"+Math.round(s.ex/tot*100)+"%</b>";
+    });
+    const tots=SCHEMES.map(s=>s.ex+nq*PER_ROW);
+    const ratio=(Math.max(...tots)/Math.min(...tots)).toFixed(2);
+    $("amNote").innerHTML=nq===1
+      ?"At nq = 1 the expand is real money: slowest / fastest = <b>"+ratio+"×</b> — nbits would matter. Drag right: every added query row reuses the already-expanded bytes."
+      :"slowest / fastest = <b>"+ratio+"×</b>"+(nq>=24
+        ?" — the flat line. At real query sizes the only nbits-dependent work is amortized to a rounding error."
+        :" and shrinking — the amber slice is fixed while the blue one grows with nq.");
+  }
+  $("amSlider").addEventListener("input",upd);upd();
+})();
+
+/* ── 11: quiz ───────────────────────────────────────────────────────── */
 (function(){
   const QS=[
     {q:"A residual-4 token is 68 stored bytes. Why does the decompress-to-GEMM path still lose, even though GEMM is near-optimal?",ch:"02",
@@ -665,7 +788,10 @@ const CDOT=0.4183;
     {q:"The fused residual kernel runs ~2.4× slower per doc than the binary kernel. The main structural reason?",ch:"07",
      opts:["tbl is a slow instruction","The centroid term varies per token, so every (query row, token) score must fold to float before the max — binary kept the whole max in integers","4-bit unpacking defeats the prefetcher","AVX2 lacks a table-lookup instruction"],right:1,
      why:"Plus 4× the payload bytes. The float fold costs a horizontal add + two float ops per pair; binary's single shared scale let it defer all of that to the very end."},
-    {q:"Does the LUT approach cover binary (1-bit), residual-2, and residual-4?",ch:"09",
+    {q:"Residual-4 streams 64 B of codes per token, residual-1 only 16 B — yet they measure the same speed (residual-1 even slower on ARM). Why don't the bytes show up?",ch:"09",
+     opts:["The CPU prefetcher hides all memory traffic","All three schemes decode to the same 512 B of floats first","Fusion made the loop compute-bound: the expand — the only nbits-dependent work — runs once per doc token, while the identical SDOT + float-fold core runs once per query row, ~32× more often","The benchmark only measures the centroid term"],right:2,
+     why:"The numpy baselines WERE byte-ordered (111 / 82 / 64 ms) because decode → GEMM is memory-bound. Fusing killed the memory round-trip; what's left is instructions, and ~95% of them don't depend on nbits."},
+    {q:"Does the LUT approach cover binary (1-bit), residual-2, and residual-4?",ch:"10",
      opts:["Only residual-4 — the others need different algebra","The identity covers all three; kernels: binary already has its (better) specialized 1-bit form, residual-4/-2/-1 are implemented — and residual-1 measured WORSE than binary at the same bytes","All three run through one generic kernel in production","Only schemes with a centroid term"],right:1,
      why:"The identity is universal (ch 05). But the 1-bit instance is *stronger* than the general kernel — mask instead of lookup, integer max — which is why class 03's kernel stays. residual-2 transfers directly; whether its quality earns a kernel is the exercise."}
   ];

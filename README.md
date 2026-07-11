@@ -76,21 +76,24 @@ python eval.py data/scifact --backend rust
 **The toy, reproducible right now** (`python eval.py data/toy`, NDCG@10 per
 domain, `lightonai/LateOn-regularized`, dim 128):
 
-| dataset | exact | residual-4 | residual-2 | binary |
-|---------|------:|-----------:|-----------:|-------:|
-| fiqa | 0.5974 | 0.6076 | 0.6067 | 0.5899 |
-| nfcorpus | 0.3995 | 0.3889 | 0.3818 | 0.3741 |
-| quora | 0.9868 | 0.9842 | 0.9835 | 0.9772 |
-| scifact | 0.7602 | 0.7453 | 0.6972 | 0.7314 |
-| **average** | 0.6860 | 0.6815 | 0.6673 | 0.6681 |
+| dataset | exact | residual-4 | residual-2 | residual-1 | binary |
+|---------|------:|-----------:|-----------:|-----------:|-------:|
+| fiqa | 0.5974 | 0.6111 | 0.6162 | 0.5934 | 0.5945 |
+| nfcorpus | 0.3995 | 0.4023 | 0.4038 | 0.3853 | 0.3804 |
+| quora | 0.9868 | 0.9842 | 0.9835 | 0.9389 | 0.9772 |
+| scifact | 0.7602 | 0.7737 | 0.7034 | 0.6517 | 0.7643 |
+| **average** | 0.6860 | 0.6928 | 0.6767 | 0.6423 | 0.6791 |
 
-B/token: exact 512, residual-4 68, residual-2 36, binary 20. **Binary keeps
-97.4% of exact NDCG at 1/25th the storage** — but look at the spread: 99.0% on
-Quora down to 93.6% on NFCorpus. *Whether a corpus binarizes is domain-dependent*,
-and this table is one `--model` flag away from testing your own. (Caveats: the
-subsampled corpora make absolute NDCG unrepresentative — NFCorpus especially,
-now balanced across all 50 queries — and with 50 queries residual can tie or
-edge out exact on noise. It's for comparing *schemes*, not for headline numbers.)
+B/token: exact 512, residual-4 68, residual-2 36, residual-1 20, binary 20.
+**Binary keeps 99% of exact NDCG at 1/25th the storage** — but look at the
+spread across domains. *Whether a corpus binarizes is domain-dependent*, and
+this table is one `--model` flag away from testing your own. Watch residual-1:
+it *ties* binary on FiQA and NFCorpus, then loses 4 points on Quora and 11 on
+SciFact — the small corpora can hide a codec's failure mode that scale exposes
+(see the at-scale table). (Caveats: the subsampled corpora make absolute NDCG
+unrepresentative — NFCorpus especially, now balanced across all 50 queries —
+and with 50 queries residual can tie or edge out exact on noise. It's for
+comparing *schemes*, not for headline numbers.)
 
 **At scale** (full SciFact, 5,183 docs → 1.19M tokens, 300 queries, Apple M4 —
 `encode.py --nano SciFact` then `eval.py`):
@@ -103,15 +106,13 @@ edge out exact on noise. It's for comparing *schemes*, not for headline numbers.
 | residual nbits=1 | 5.5 | 20 | 0.6312 | 82.7% | 64 |
 | binary (1-bit) | 3.6 | 20 | 0.7460 | 97.8% | 17.7 |
 
-Binary matches exhaustive latency at 1/25th the storage; with the Rust kernels
-(`--backend rust`) binary drops to **6.2 ms** and — via the fused LUT kernels —
-residual-4 to **7.9 ms** and residual-2 to **8.0 ms**, all ~2.5–3× faster than
-exhaustive. The residual-4 row is the headline: the *best-quality* compressed
-scheme (99.2% retention) at binary-path speed, 85 MB against a 610 MB float
-corpus. And read the residual-1 row twice: it spends **exactly binary's
-20 B/token** and loses 11 NDCG points to it — same budget, worse codec. How
-you spend bits matters more than how many you spend; sign bits happen to be a
-very good 1-bit code for this checkpoint.
+These are the **baseline** numbers — pure numpy, stage 2 scored the honest
+textbook way. The Rust kernels start from this table and cut every scheme to
+6–9 ms (next section). Two rows to read twice. residual-4 is the *quality*
+headline: 99.2% retention at 85 MB against a 610 MB float corpus. And
+residual-1 spends **exactly binary's 20 B/token** yet loses 11 NDCG points to
+it — same budget, worse codec. How you spend bits matters more than how many
+you spend; sign bits happen to be a very good 1-bit code for this checkpoint.
 
 ## profiling (`eval.py --profile`)
 
@@ -139,24 +140,46 @@ has. That also means the Rust kernels pay for themselves: they attack the
 dominant cost. The lesson is the ordering: the SIMD kernel was worthless until
 pruning made rescore the bottleneck; profile first, optimize the tall bar.
 
-The first release of this repo said `--backend rust` was **binary-only**,
-"because residual rescore is a `decode → BLAS matmul` and BLAS is already the
-fast path a hand kernel can't beat." True — and beside the point. You don't
-out-multiply BLAS; you stop feeding it. The [fused residual
-kernels](kernels/README.md) score the packed codes *directly* for every
-nbits ∈ {1, 2, 4} — the shared decode table is int8-quantized once, an
-in-register table lookup (NEON `tbl` / AVX2 `pshufb`) replaces decompression,
-and the centroid half of every dot product is a lookup into the matrix stage 1
-already computed. The binary `2P − T` trick turns out to be the 1-bit special
-case of this LUT identity (the 1-bit kernel needs no table at all: the affine
-form `(w₁−w₀)·P + w₀·T`). Result: residual-4 drops 111 → 7.9 ms (**14×**) at
-a measured −0.0005 NDCG and residual-2 drops 82 → 8.0 ms (**10×**) — the
-best-quality scheme now runs at binary speed, streaming 68 B/token instead of
-the 512 B/token BLAS needed. Note the fused family is nearly *nbits-flat* in
-latency (7.9 / 8.0 / 8.9 ms): the shared integer core and float fold dominate,
-not the payload bytes — which is also why residual-1 buys no speed with its
-smaller codes, while its quality collapse (see the table above) makes it a
-measured negative result worth reading, not running.
+### baselines: where each speedup is measured from
+
+Every scheme's baseline is the numpy engine itself — same pipeline, same
+index, stage 2 scored the straightforward way. The Rust kernels change *how*
+the same math executes, never *what* it computes:
+
+| scheme | numpy baseline (stage 2) | p50 | fused kernel | p50 | speedup | NDCG: numpy → rust |
+|--------|--------------------------|----:|--------------|----:|--------:|:-------------------|
+| binary | unpack bits → f32 GEMM | 17.7 | `2P−T`, SDOT/AVX2-SAD | **6.2** | 2.9× | 0.7460 → 0.7460 |
+| residual-4 | decode floats → f32 GEMM | 111 | LUT (`tbl`/`pshufb`) + SDOT | **7.9** | 14× | 0.7567 → 0.7562 |
+| residual-2 | decode floats → f32 GEMM | 82 | LUT + SDOT | **8.0** | 10× | 0.7340 → 0.7349 |
+| residual-1 | decode floats → f32 GEMM | 64 | affine `2P−T` | 8.9 | 7× | 0.6312 → 0.6315 |
+
+The NDCG column is the **non-regression check**: binary is bit-identical by
+construction; the residual rungs differ only by the LUT's int8 rounding
+(≤ ±0.0009, within query noise), and `kernels/test_bridge.py` pins every
+kernel to the numpy spec on every CI platform. Note residual-1's low score is
+already in the *baseline* column — the quality loss is a property of the
+1-bit-residual **codec** at this scale, not of the kernels (on the toy sets it
+ties binary on FiQA and NFCorpus).
+
+Two more honest readings. **The 14× is partly a numpy tax:** residual-4's
+111 ms baseline is ~96% decode machinery (unpack bits, index the table,
+materialize floats) and only ~4 ms of actual GEMM; a compiled decode → GEMM
+(what next-plaid does today) would sit near 15–25 ms, so the win a production
+port should expect is 2–3×, like binary's. **The history:** the first release
+said `--backend rust` was binary-only, "because residual rescore is a
+`decode → BLAS matmul` and BLAS is already the fast path a hand kernel can't
+beat." True — and beside the point. You don't out-multiply BLAS; you stop
+feeding it: the [fused residual kernels](kernels/README.md) score the packed
+codes *directly* — an in-register table lookup (NEON `tbl` / AVX2 `pshufb`)
+replaces decompression, and the centroid half of every dot product is a lookup
+into the matrix stage 1 already computed. The binary `2P − T` trick is the
+1-bit special case of this LUT identity. The fused family is nearly
+*nbits-flat* in latency (7.9 / 8.0 / 8.9 ms): the integer dot-product core and
+the float max — which every nbits shares — dominate, while the payload bytes
+(what nbits changes) don't; [Class 04](https://joe32140.github.io/nano-plaid/class4.html)
+walks the cost breakdown. That's also why residual-1 buys no speed with its
+smaller codes, while its quality collapse makes it a measured negative result
+worth reading, not running.
 
 **The knob that matters is `n_full`** — how many candidates get exact-rescored.
 Since rescore dominates, it's the recall/latency dial (binary, SciFact):
