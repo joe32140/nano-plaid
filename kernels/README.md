@@ -50,26 +50,23 @@ SMMLA wherever `i8mm` exists — a measured ~1% giveback on the M4 bought a
 benching it on more than one microarchitecture, is the whole lesson.
 
 Indicative per-platform numbers from CI's shared runners (one run, ratios >
-absolutes; M4 numbers above are from an idle local machine). µs/doc:
+absolutes; M4 numbers above are from an idle local machine). µs/doc, showing
+each residual rung's `tbl`+SDOT baseline → its shipped `_vfold`:
 
-| platform | binary | r4 | r2 | r1 | SMMLA |
-|----------|-------:|---:|---:|---:|------:|
-| x86_64 AVX2 (ubuntu-latest) | 7.4 | 12.9 | 12.9 | 11.0 | – |
-| Apple M1 (macos-latest) | 2.6 | 6.6 | 6.6 | 8.7 | no i8mm |
-| Neoverse N2 (ubuntu-24.04-arm) | 4.9 | 8.5 | 8.5 | 9.6 | **3.5** |
+| platform | binary | r4 → vfold | r2 → vfold | r1 → vfold | SMMLA |
+|----------|-------:|-----------:|-----------:|-----------:|------:|
+| x86_64 AVX2 (ubuntu-latest) | 7.4 | 12.9 → **7.9** | 12.9 → **7.9** | 11.0 → **5.5** | – |
+| Apple M1 (macos-latest) | 2.5 | 6.5 → **3.1** | 6.6 → **3.3** | 8.3 → **3.7** | no i8mm |
+| Neoverse N2 (ubuntu-24.04-arm) | 4.8 | 8.5 → **5.6** | 8.5 → **5.7** | 9.5 → **6.3** | **3.5** |
 
-The nbits-flat pattern replicates on every microarchitecture — r4 and r2 are
-within noise of each other on all three. One platform-specific inversion: on
-AVX2, r1 is the *fastest* residual rung (its affine form rides the masked-SAD
-machinery, cheaper than the shufb + sign-transfer chain), while on both ARM
-cores r1 is the slowest. Same source, three CPUs, three different orderings —
-the recurring moral of this crate.
-
-(These are the `tbl`+SDOT / shufb rungs. The shipped `_vfold` rungs run the
-same compute with the vectorized fold; the CI bench prints both side by side.
-On the M4 the fold is a flat ~2.1× win across all three rungs — the numbers in
-the second-ladder table above. The AVX2 and Neoverse folds are read off CI and
-folded into this table once the run lands.)
+The vectorized fold wins on every microarchitecture — 1.5× (Neoverse) to 2.2×
+(M1) — and the family stays nbits-flat after it. Two platform-specific
+inversions survive into the vfold column. On AVX2 the fold helps r1 *most*
+(2.0×), so **r1 vfold (5.5) is the fastest residual rung and beats even the
+binary kernel (7.4)** — its affine form rides the cheap masked-SAD path, which
+on x86 undercuts both the shufb chain and binary's own SAD loop. On both ARM
+cores r1 stays the slowest residual rung. Same source, three CPUs, different
+orderings — the recurring moral of this crate.
 
 ## the math
 

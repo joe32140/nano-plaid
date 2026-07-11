@@ -15,6 +15,8 @@
   .callout{margin:20px 0;padding:16px 18px;border:1px solid var(--line);border-left:3px solid var(--ok);
     border-radius:10px;background:var(--panel-2)}
   .callout p{margin:0}
+  .eq{margin:10px 0;padding:9px 12px;border-radius:7px;background:var(--panel);overflow-x:auto}
+  .eq code{white-space:nowrap;font-size:15px}
   .kv{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px;font-family:var(--mono);
       font-size:14px;font-variant-numeric:tabular-nums}
   .kv .k{color:var(--faint)} .kv b{font-size:17px}
@@ -363,10 +365,29 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   <p>The wrinkle: <strong>the max moved to float.</strong> Class 03's kernel kept every score
   an integer until the very end, because one shared scale can't change which token wins a max.
   Here the centroid term differs per token, so each (query row, token) score must fold to f32
-  <em>before</em> comparing. That costs a horizontal add and two float ops per pair — it's the
-  main reason this kernel runs ~2.4× the binary kernel's time instead of matching it. Still
-  bit-identical across scalar, NEON, and AVX2 rungs — the f32 operation order is part of the
-  spec, tested on every CI platform.</p>
+  <em>before</em> comparing. Still bit-identical across scalar, NEON, and AVX2 rungs — the f32
+  operation order is part of the spec, tested on every CI platform. That fold is the <em>whole</em>
+  reason this kernel doesn't already match binary — which is worth pinning down, because it also
+  answers a question the numbers provoke.</p>
+
+  <div class="callout">
+    <p><b>Why isn't binary far faster than residual-1?</b> Both quantize the doc token to a
+    single bit, yet residual-1 seems to carry strictly more — a centroid <em>and</em> a
+    residual. But <b>"centroid + residual" is not two dot products.</b> Expand the score:</p>
+    <div class="eq"><code>q·(centroid + residual)  =  q·centroid  +  q·residual</code></div>
+    <p>The first term is a <em>lookup</em> — <code>cdot[cid]</code>, the very matrix stage 1
+    already built for pruning — not a multiply. The second is <em>the same</em>
+    <code>P = q·bits</code> the binary kernel computes; residual-1 literally reuses binary's
+    inner loop (8 SDOTs / masked-SAD). So the only genuinely extra work is the fold: residual-1
+    adds the per-token centroid in float and maxes in float, where binary stays integer to the
+    end.</p>
+    <p style="margin-top:10px">That fold <em>was</em> the entire gap — and it was bigger than a
+    2× hunch: before chapter 09 vectorized it, binary (~1.9 µs) ran <b>~3× faster</b> than
+    residual-1 (~5.5 µs). Vectorizing the fold cut residual-1 to ~2.35 µs and collapsed the gap
+    to <b>~1.2×</b>. Binary is barely ahead now for a precise reason: its one advantage was
+    keeping the max in integers, and the fold is what finally gave residual a cheap, vectorized
+    version of the same step.</p>
+  </div>
 </section>
 
 <!-- ═══ 08 MEASURED ═══ -->
@@ -402,15 +423,17 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
 
   <div class="tbl-wrap">
     <table>
-      <tr><th>CI platform (shared VMs — ratios, not absolutes)</th><th>binary fused</th><th>residual-4 (tbl+SDOT rung)</th></tr>
-      <tr><td class="mono x86">x86-64 AVX2 <span class="pill">ubuntu</span></td><td class="mono">7.9 µs/doc</td><td class="mono">13.1 µs/doc</td></tr>
-      <tr><td class="mono arm">Apple M1 <span class="pill">macos</span></td><td class="mono">2.7 µs/doc</td><td class="mono">7.1 µs/doc</td></tr>
-      <tr><td class="mono arm">Neoverse N2 <span class="pill">ubuntu-arm</span></td><td class="mono">4.9 µs/doc</td><td class="mono">8.5 µs/doc</td></tr>
+      <tr><th>CI platform (shared VMs — ratios, not absolutes)</th><th>binary</th><th>residual-4: tbl → <b>vfold</b></th></tr>
+      <tr><td class="mono x86">x86-64 AVX2 <span class="pill">ubuntu</span></td><td class="mono">7.4 µs/doc</td><td class="mono">12.9 → <b>7.9</b> µs/doc</td></tr>
+      <tr><td class="mono arm">Apple M1 <span class="pill">macos</span></td><td class="mono">2.5 µs/doc</td><td class="mono">6.5 → <b>3.1</b> µs/doc</td></tr>
+      <tr><td class="mono arm">Neoverse N2 <span class="pill">ubuntu-arm</span></td><td class="mono">4.8 µs/doc</td><td class="mono">8.5 → <b>5.6</b> µs/doc</td></tr>
     </table>
   </div>
-  <p class="note">This column is the scalar-fold <code>tbl</code>+SDOT rung; the shipped
-  vectorized-fold kernel (chapter 09) runs it ~2× faster — on the M4, 4.5 → 2.2 µs/doc. The CI
-  bench prints both side by side on all three platforms.</p>
+  <p class="note">The chapter-09 vectorized fold (the shipped rung) replicates on every
+  platform — 1.5× on Neoverse to 2.2× on the M1. One inversion worth its own note: on AVX2 the
+  fold helps residual-<em>1</em> most (2.0×), so its affine-SAD form lands at 5.5 µs/doc —
+  faster than every other residual rung <em>and</em> faster than the binary kernel's own SAD
+  loop. Same source, three CPUs, three orderings.</p>
   <p>The third runner earned its place the day it was added: it caught the <code>sdot</code>
   assembly relying on Apple's baseline features (a one-line <code>.arch_extension</code> fix),
   and it settled class 03's SMMLA cliffhanger — the instruction that only <em>tied</em> SDOT
