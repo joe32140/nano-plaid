@@ -13,7 +13,7 @@ The arc, top to bottom:
                                      nearest-centroid id ("code").
   2. residual compression         -- store each token as (centroid id +
                                      quantized residual). The storage knob:
-                                     nbits in {2, 4}.
+                                     nbits in {1, 2, 4}.
   3. binary compression           -- store each token as its sign bits only
                                      (32x smaller than float32), score with an
                                      int8 query via the 2P - T identity.
@@ -124,7 +124,9 @@ def assign(x, centroids, chunk=65_536):
 # The residual's per-value distribution is carved into 2^nbits buckets by
 # quantiles; each value stores only its bucket index (nbits bits), and decodes
 # to the bucket's midpoint. nbits=4 is near-lossless; nbits=2 is 2x smaller
-# and visibly lossier. bytes/token = dim * nbits / 8 (+4 for the code).
+# and visibly lossier; nbits=1 matches binary's budget but anchors each token
+# at its centroid with a trained 2-value table instead of raw sign bits.
+# bytes/token = dim * nbits / 8 (+4 for the code).
 
 
 @dataclass
@@ -478,7 +480,8 @@ if __name__ == "__main__":
 
     exact_top, _ = search_exhaustive(q, corpus, doc_offsets, k=5)
     assert exact_top[0] == 123
-    for scheme, nbits in [("residual", 4), ("residual", 2), ("binary", 0)]:
+    for scheme, nbits in [("residual", 4), ("residual", 2), ("residual", 1),
+                          ("binary", 0)]:
         idx = build(corpus, doc_lens, scheme=scheme, nbits=nbits,
                     n_centroids=256, verbose=False)
         top, _ = search(idx, q, k=5, n_probe=4, n_full=100)
@@ -497,26 +500,28 @@ if __name__ == "__main__":
             slow = (2 * p - int(q8.sums[i])) * q8.scales[i]
             assert abs(slow - fast[i, j]) < 1e-3
 
-    # The fused-residual LUT identity, same treatment: (a) the integer path
-    # matches a literal per-element loop exactly, (b) it stays close to the
-    # float decode path (its only extra error is int8-ing q and the 16 weights).
-    ridx = build(corpus, doc_lens, scheme="residual", nbits=4,
-                 n_centroids=256, verbose=False)
-    lut = quantize_lut(ridx.codec)
-    cdot = q @ ridx.centroids.T
-    rows = np.arange(50)
-    fast = score_residual_lut(q8, lut, ridx.payload[rows], ridx.codes[rows],
-                              cdot, dim, 4)
-    codes_u = unpack_codes(ridx.payload[rows], dim, 4)
-    for i in range(len(q8.values)):
-        for j in range(0, 50, 7):
-            acc = int((q8.values[i].astype(np.int32)
-                       * lut.values[codes_u[j]].astype(np.int32)).sum())
-            slow = (np.float32(q8.scales[i] * lut.scale) * np.float32(acc)
-                    + cdot[i, ridx.codes[j]])
-            assert slow == fast[i, j], "LUT integer spec drifted"
-    exact_sim = q @ decode_rows(ridx, rows).T
-    err = np.abs(fast - exact_sim).max()
-    assert err < 0.01, f"LUT path strayed from float decode: {err}"
-    print(f"residual LUT identity ok (max |lut - float decode| = {err:.4f})")
+    # The fused-residual LUT identity, same treatment for every nbits: (a) the
+    # integer path matches a literal per-element loop exactly, (b) it stays
+    # close to the float decode path (its only extra error is int8-ing q and
+    # the 2^nbits weights — loosest at nbits=1, where the buckets are coarsest).
+    for nbits in (4, 2, 1):
+        ridx = build(corpus, doc_lens, scheme="residual", nbits=nbits,
+                     n_centroids=256, verbose=False)
+        lut = quantize_lut(ridx.codec)
+        cdot = q @ ridx.centroids.T
+        rows = np.arange(50)
+        fast = score_residual_lut(q8, lut, ridx.payload[rows], ridx.codes[rows],
+                                  cdot, dim, nbits)
+        codes_u = unpack_codes(ridx.payload[rows], dim, nbits)
+        for i in range(len(q8.values)):
+            for j in range(0, 50, 7):
+                acc = int((q8.values[i].astype(np.int32)
+                           * lut.values[codes_u[j]].astype(np.int32)).sum())
+                slow = (np.float32(q8.scales[i] * lut.scale) * np.float32(acc)
+                        + cdot[i, ridx.codes[j]])
+                assert slow == fast[i, j], f"LUT integer spec drifted (nbits={nbits})"
+        exact_sim = q @ decode_rows(ridx, rows).T
+        err = np.abs(fast - exact_sim).max()
+        assert err < 0.01, f"LUT path strayed from float decode (nbits={nbits}): {err}"
+        print(f"residual-{nbits} LUT identity ok (max |lut - float decode| = {err:.4f})")
     print("2P - T identity matches the per-bit loop. All good.")

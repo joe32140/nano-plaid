@@ -11,7 +11,7 @@ use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods}
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::{maxsim, maxsim_r4, quantize_query_i8, LutI8};
+use crate::{maxsim, maxsim_r1, maxsim_r2, maxsim_r4, quantize_query_i8, LutI8};
 
 /// Per-document binary MaxSim for one query against packed candidate rows.
 ///
@@ -83,23 +83,25 @@ fn maxsim_docs<'py>(
     Ok(PyArray1::from_vec_bound(py, out))
 }
 
-/// Per-document fused residual-4 MaxSim for one query against packed rows.
+/// Per-document fused residual MaxSim (nbits ∈ {4, 2, 1}) for one query
+/// against packed rows.
 ///
 /// - `query`: `[nq, dim]` f32, C-contiguous
-/// - `codes`: `[sum(lens), dim/2]` u8 packed 4-bit bucket indices
+/// - `codes`: `[sum(lens), dim*nbits/8]` u8 packed bucket indices
 /// - `cids`: `[sum(lens)]` u32, each token's centroid id
 /// - `cdot_t`: `[K, nq]` f32 — the stage-1 `q @ centroids.T` matrix,
 ///   TRANSPOSED so a token's per-query-row lookups are contiguous
 /// - `lens`: `[n_docs]` i64, tokens per candidate doc
-/// - `lut_values` / `lut_scale`: `nanoplaid.quantize_lut`'s 16-entry int8
-///   table (entries must stay in [-127, 127] — the numpy quantizer clips)
+/// - `lut_values` / `lut_scale`: `nanoplaid.quantize_lut`'s `2^nbits`-entry
+///   int8 table (entries must stay in [-127, 127] — the numpy quantizer clips)
+/// - `nbits`: 4, 2, or 1 — picks the kernel family rung
 ///
 /// Returns `[n_docs]` f32, matching `nanoplaid.score_residual_lut` followed by
 /// the per-doc max-reduce and sum: identical per-(row, token) f32 scores; the
 /// final sum can differ only in the last ulps (numpy sums pairwise).
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn maxsim_docs_r4<'py>(
+fn maxsim_docs_lut<'py>(
     py: Python<'py>,
     query: PyReadonlyArray2<'py, f32>,
     codes: PyReadonlyArray2<'py, u8>,
@@ -108,10 +110,14 @@ fn maxsim_docs_r4<'py>(
     lens: PyReadonlyArray1<'py, i64>,
     lut_values: PyReadonlyArray1<'py, i8>,
     lut_scale: f32,
+    nbits: usize,
 ) -> PyResult<Bound<'py, PyArray1<f32>>> {
     let dim = query.shape()[1];
     let nq = query.shape()[0];
-    let pd = dim / 2;
+    if !matches!(nbits, 1 | 2 | 4) {
+        return Err(PyValueError::new_err("nbits must be 1, 2, or 4"));
+    }
+    let pd = dim * nbits / 8;
     if dim == 0 || dim % 8 != 0 {
         return Err(PyValueError::new_err(
             "dim must be a positive multiple of 8",
@@ -122,7 +128,7 @@ fn maxsim_docs_r4<'py>(
     }
     if codes.shape()[1] != pd {
         return Err(PyValueError::new_err(
-            "codes column count must equal dim/2 (nbits = 4)",
+            "codes column count must equal dim*nbits/8",
         ));
     }
     if cdot_t.shape()[1] != nq {
@@ -131,8 +137,10 @@ fn maxsim_docs_r4<'py>(
         ));
     }
     let n_centroids = cdot_t.shape()[0];
-    if lut_values.shape()[0] != 16 {
-        return Err(PyValueError::new_err("lut_values must have 16 entries"));
+    if lut_values.shape()[0] != 1 << nbits {
+        return Err(PyValueError::new_err(
+            "lut_values must have 2^nbits entries",
+        ));
     }
     let q = query
         .as_slice()
@@ -167,24 +175,31 @@ fn maxsim_docs_r4<'py>(
     if cids.iter().any(|&c| c as usize >= n_centroids) {
         return Err(PyValueError::new_err("centroid id out of range for cdot_t"));
     }
-    if lv.iter().any(|&v| v == i8::MIN) {
+    if lv.contains(&i8::MIN) {
         return Err(PyValueError::new_err(
             "lut values must be in [-127, 127] (quantize_lut clips)",
         ));
     }
 
+    // Pad the table to LutI8's 16 slots; slots past 2^nbits stay zero (no
+    // code can index them — the LutI8 invariant).
     let mut values = [0i8; 16];
-    values.copy_from_slice(lv);
+    values[..lv.len()].copy_from_slice(lv);
     let lut = LutI8 {
         values,
         scale: lut_scale,
+    };
+    let kernel = match nbits {
+        4 => maxsim_r4,
+        2 => maxsim_r2,
+        _ => maxsim_r1,
     };
     let q8 = quantize_query_i8(q, dim);
     let mut out = Vec::with_capacity(lens.len());
     let mut off = 0usize;
     for &n in lens {
         let n = n as usize;
-        out.push(maxsim_r4(
+        out.push(kernel(
             &q8,
             &lut,
             &codes[off * pd..(off + n) * pd],
@@ -199,6 +214,6 @@ fn maxsim_docs_r4<'py>(
 #[pymodule]
 fn nanoplaid_kernels(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(maxsim_docs, m)?)?;
-    m.add_function(wrap_pyfunction!(maxsim_docs_r4, m)?)?;
+    m.add_function(wrap_pyfunction!(maxsim_docs_lut, m)?)?;
     Ok(())
 }

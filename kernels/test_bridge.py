@@ -33,19 +33,21 @@ err = np.abs(ref - got).max()
 assert err < 1e-3, f"binary bridge drifted from numpy spec: {err}"
 print(f"binary  parity ok  (max |numpy - rust| = {err:.2e})")
 
-# --- fused residual-4: the LUT identity --------------------------------------
-codes = rng.integers(0, 256, (total, dim // 2)).astype(np.uint8)
+# --- fused residual family (nbits in {4, 2, 1}): the LUT identity ------------
 cids = rng.integers(0, K, total).astype(np.uint32)
 cdot = (rng.standard_normal((nq, K)) * 2).astype(np.float32)
-weights = np.sort(rng.standard_normal(16).astype(np.float32) * 0.03)
-lut = npl.quantize_lut(npl.ResidualCodec(4, np.zeros(15, np.float32), weights))
+for nbits in (4, 2, 1):
+    codes = rng.integers(0, 256, (total, dim * nbits // 8)).astype(np.uint8)
+    weights = np.sort(rng.standard_normal(2 ** nbits).astype(np.float32) * 0.03)
+    lut = npl.quantize_lut(
+        npl.ResidualCodec(nbits, np.zeros(2 ** nbits - 1, np.float32), weights))
 
-sim = npl.score_residual_lut(q8, lut, codes, cids, cdot, dim, 4)
-ref = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
-got = nk.maxsim_docs_r4(q, codes, cids, np.ascontiguousarray(cdot.T),
-                        lens.astype(np.int64),
-                        np.ascontiguousarray(lut.values, np.int8),
-                        float(lut.scale))
-err = np.abs(ref - got).max()
-assert err < 1e-4, f"residual bridge drifted from numpy spec: {err}"
-print(f"residual parity ok (max |numpy - rust| = {err:.2e})")
+    sim = npl.score_residual_lut(q8, lut, codes, cids, cdot, dim, nbits)
+    ref = np.maximum.reduceat(sim, bounds, axis=1).sum(axis=0)
+    got = nk.maxsim_docs_lut(q, codes, cids, np.ascontiguousarray(cdot.T),
+                             lens.astype(np.int64),
+                             np.ascontiguousarray(lut.values, np.int8),
+                             float(lut.scale), nbits)
+    err = np.abs(ref - got).max()
+    assert err < 1e-4, f"residual-{nbits} bridge drifted from numpy spec: {err}"
+    print(f"residual-{nbits} parity ok (max |numpy - rust| = {err:.2e})")

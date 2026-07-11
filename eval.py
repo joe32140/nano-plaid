@@ -95,7 +95,7 @@ def eval_bundle(b, schemes, args, scorer, verbose=False, profile=False):
         centroids = idx.centroids
         s = scorer if name == "binary" else None
         rs = None
-        if args.backend == "rust" and name == "residual" and nbits == 4:
+        if args.backend == "rust" and name == "residual" and nbits in (1, 2, 4):
             rs = make_rust_residual_scorer(idx)
         stages = {} if profile else None
         n, lat = run(b, lambda q: npl.search(idx, q, args.k, args.n_probe,
@@ -204,13 +204,14 @@ def print_profile(results, schemes, k, note=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bundle", help="a bundle dir, or a directory of bundles (e.g. data/toy)")
-    ap.add_argument("--schemes", default="exact,residual4,residual2,binary")
+    ap.add_argument("--schemes", default="exact,residual4,residual2,residual1,binary")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--n-probe", type=int, default=8)
     ap.add_argument("--n-full", type=int, default=1024)
     ap.add_argument("--backend", choices=["numpy", "rust"], default="numpy",
-                    help="binary stage-2 scorer; 'rust' needs the kernels extension "
-                         "(maturin develop -m kernels/Cargo.toml --release --features python)")
+                    help="stage-2 scorer for the binary and residual schemes; 'rust' "
+                         "needs the kernels extension (maturin develop -m "
+                         "kernels/Cargo.toml --release --features python)")
     ap.add_argument("--profile", action="store_true",
                     help="report index memory, build time, and per-stage query latency")
     args = ap.parse_args()
@@ -239,24 +240,26 @@ def make_rust_scorer():
 
 
 def make_rust_residual_scorer(idx):
-    """Wrap the fused residual-4 kernel as a nanoplaid residual_scorer. The
-    int8 LUT comes from the index's codec (quantize_lut, the numpy spec the
-    kernel matches bit-for-bit); the stage-1 centroid matrix is transposed at
-    the boundary so each token's per-query-row lookups are contiguous."""
+    """Wrap the fused residual kernel family (nbits in {1, 2, 4}) as a
+    nanoplaid residual_scorer. The int8 LUT comes from the index's codec
+    (quantize_lut, the numpy spec the kernels match bit-for-bit); the stage-1
+    centroid matrix is transposed at the boundary so each token's
+    per-query-row lookups are contiguous."""
     import nanoplaid_kernels
 
+    nbits = idx.codec.nbits
     lut = npl.quantize_lut(idx.codec)
     lut_values = np.ascontiguousarray(lut.values, np.int8)
     lut_scale = float(lut.scale)
 
     def scorer(q, packed, cids, cdot, lens):
-        return nanoplaid_kernels.maxsim_docs_r4(
+        return nanoplaid_kernels.maxsim_docs_lut(
             np.ascontiguousarray(q, np.float32),
             np.ascontiguousarray(packed, np.uint8),
             np.ascontiguousarray(cids, np.uint32),
             np.ascontiguousarray(cdot.T, np.float32),
             np.ascontiguousarray(lens, np.int64),
-            lut_values, lut_scale)
+            lut_values, lut_scale, nbits)
 
     return scorer
 

@@ -119,17 +119,32 @@ fn main() {
         );
     }
 
-    // ── fused residual-4: the LUT identity ────────────────────────────────
-    // Same doc set, now as 4-bit residual codes + a centroid id per token.
-    // The float baseline for this scheme is decompress + BLAS GEMM, which
-    // this bench can't reproduce dependency-free; rung 1's f32 loop stands in
-    // as the common yardstick, so compare the residual rungs to each other
-    // and to the binary fused kernel above.
+    // ── the fused residual family: the LUT identity ───────────────────────
+    // Same doc set, now as packed residual codes + a centroid id per token
+    // (4-bit, then 2-bit, then 1-bit — random bytes are valid codes for any
+    // nbits). The float baseline for this scheme is decompress + BLAS GEMM,
+    // which this bench can't reproduce dependency-free; rung 1's f32 loop
+    // stands in as the common yardstick, so compare the residual rungs to
+    // each other and to the binary fused kernel above.
     let mut s2 = 7u64;
     const K: usize = 4096;
     let r4_codes: Vec<Vec<u8>> = (0..N_DOCS)
         .map(|_| {
             (0..DOC_TOKENS * DIM / 2)
+                .map(|_| ((randf(&mut s2) + 0.5) * 255.99) as u8)
+                .collect()
+        })
+        .collect();
+    let r2_codes: Vec<Vec<u8>> = (0..N_DOCS)
+        .map(|_| {
+            (0..DOC_TOKENS * DIM / 4)
+                .map(|_| ((randf(&mut s2) + 0.5) * 255.99) as u8)
+                .collect()
+        })
+        .collect();
+    let r1_codes: Vec<Vec<u8>> = (0..N_DOCS)
+        .map(|_| {
+            (0..DOC_TOKENS * DIM / 8)
                 .map(|_| ((randf(&mut s2) + 0.5) * 255.99) as u8)
                 .collect()
         })
@@ -151,31 +166,62 @@ fn main() {
         scale: 0.0031,
     };
 
-    let tr_scalar = best_of(|| {
-        r4_codes
-            .iter()
-            .zip(&r4_cids)
-            .map(|(c, ids)| maxsim_r4_scalar(&q, &lut, c, ids, &cdot_t))
-            .sum()
-    });
-    let tr_fused = maxsim_r4_fused(&q, &lut, &r4_codes[0], &r4_cids[0], &cdot_t).map(|_| {
-        best_of(|| {
-            r4_codes
-                .iter()
-                .zip(&r4_cids)
-                .map(|(c, ids)| maxsim_r4_fused(&q, &lut, c, ids, &cdot_t).unwrap())
-                .sum()
-        })
-    });
+    // One timing pair (scalar reference, fused-if-supported) per nbits rung.
+    macro_rules! time_rung {
+        ($codes:expr, $scalar:path, $fused:path) => {{
+            let ts = best_of(|| {
+                $codes
+                    .iter()
+                    .zip(&r4_cids)
+                    .map(|(c, ids)| $scalar(&q, &lut, c, ids, &cdot_t))
+                    .sum()
+            });
+            let tf = $fused(&q, &lut, &$codes[0], &r4_cids[0], &cdot_t).map(|_| {
+                best_of(|| {
+                    $codes
+                        .iter()
+                        .zip(&r4_cids)
+                        .map(|(c, ids)| $fused(&q, &lut, c, ids, &cdot_t).unwrap())
+                        .sum()
+                })
+            });
+            (ts, tf)
+        }};
+    }
+    let (tr4_scalar, tr4_fused) = time_rung!(r4_codes, maxsim_r4_scalar, maxsim_r4_fused);
+    let (tr2_scalar, tr2_fused) = time_rung!(r2_codes, maxsim_r2_scalar, maxsim_r2_fused);
+    let (tr1_scalar, tr1_fused) = time_rung!(r1_codes, maxsim_r1_scalar, maxsim_r1_fused);
 
-    println!("\nfused residual-4 (LUT identity; same shape, 4-bit codes + centroid ids):");
-    line("r4      scalar reference", tr_scalar);
-    if let Some(t) = tr_fused {
-        #[cfg(target_arch = "aarch64")]
-        line("r4      fused NEON tbl  ", t);
-        #[cfg(target_arch = "x86_64")]
-        line("r4      fused AVX2 shufb", t);
-    } else {
-        println!("  (no fused residual kernel for this CPU)");
+    #[cfg(target_arch = "aarch64")]
+    let fused_names = [
+        "r4      fused NEON tbl  ",
+        "r2      fused NEON tbl  ",
+        "r1      fused NEON sdot ",
+    ];
+    #[cfg(target_arch = "x86_64")]
+    let fused_names = [
+        "r4      fused AVX2 shufb",
+        "r2      fused AVX2 shufb",
+        "r1      fused AVX2 SAD  ",
+    ];
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let fused_names = [""; 3];
+
+    println!("\nfused residual family (LUT identity; packed codes + centroid ids):");
+    for (i, (ts, tf)) in [
+        (tr4_scalar, tr4_fused),
+        (tr2_scalar, tr2_fused),
+        (tr1_scalar, tr1_fused),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = [4, 2, 1][i];
+        line(&format!("r{n}      scalar reference"), ts);
+        if let Some(t) = tf {
+            line(fused_names[i], t);
+        } else {
+            println!("  (no fused residual-{n} kernel for this CPU)");
+        }
     }
 }

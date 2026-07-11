@@ -42,7 +42,7 @@ vs speed vs storage:
 0. **Exhaustive MaxSim** — exact, slow, the reference for everything else
 1. **k-means centroids** — every corpus token gets a nearest-centroid id
 2. **residual compression** — token ≈ centroid + quantized residual
-   (nbits ∈ {2, 4}: 7.5×–14× smaller than float32)
+   (nbits ∈ {1, 2, 4}: 7.5×–25× smaller than float32)
 3. **binary compression** — token ≈ its sign bits (25× smaller), scored by an
    int8 query through the `2P − T` identity, no decompression
 4. **the index** — centroids + codes + inverted file + compressed payload
@@ -97,16 +97,21 @@ edge out exact on noise. It's for comparing *schemes*, not for headline numbers.
 
 | scheme | build s | bytes/token | NDCG@10 | retention | p50 ms/query |
 |--------|--------:|------------:|--------:|----------:|-------------:|
-| exhaustive f32 | – | 512 | 0.7629 | 100% | 19.7 |
-| residual nbits=4 | 16 | 68 | 0.7567 | 99.2% | 114 |
-| residual nbits=2 | 6.4 | 36 | 0.7340 | 96.2% | 84 |
-| binary (1-bit) | 3.5 | 20 | 0.7460 | 97.8% | 19.7 |
+| exhaustive f32 | – | 512 | 0.7629 | 100% | 20.0 |
+| residual nbits=4 | 17 | 68 | 0.7567 | 99.2% | 111 |
+| residual nbits=2 | 6.5 | 36 | 0.7340 | 96.2% | 82 |
+| residual nbits=1 | 5.5 | 20 | 0.6312 | 82.7% | 64 |
+| binary (1-bit) | 3.6 | 20 | 0.7460 | 97.8% | 17.7 |
 
 Binary matches exhaustive latency at 1/25th the storage; with the Rust kernels
-(`--backend rust`) binary drops to **8.2 ms** and — via the fused LUT kernel —
-residual-4 to **8.4 ms**, both ~2.4× faster than exhaustive. That last row is
-the interesting one: the *best-quality* compressed scheme (99.2% retention) at
-binary-path speed, 85 MB against a 610 MB float corpus.
+(`--backend rust`) binary drops to **6.2 ms** and — via the fused LUT kernels —
+residual-4 to **7.9 ms** and residual-2 to **8.0 ms**, all ~2.5–3× faster than
+exhaustive. The residual-4 row is the headline: the *best-quality* compressed
+scheme (99.2% retention) at binary-path speed, 85 MB against a 610 MB float
+corpus. And read the residual-1 row twice: it spends **exactly binary's
+20 B/token** and loses 11 NDCG points to it — same budget, worse codec. How
+you spend bits matters more than how many you spend; sign bits happen to be a
+very good 1-bit code for this checkpoint.
 
 ## profiling (`eval.py --profile`)
 
@@ -116,12 +121,15 @@ absolute ms drift a little run to run — compare within the table):
 
 | scheme | index MB | build s | p50 ms | probe/rank/rescore % |
 |--------|---------:|--------:|-------:|---------------------:|
-| exact | 610 (float corpus) | – | 19.7 | – |
-| residual-4 | 85 | 16 | 114 | 1 / 0 / 99 |
-| residual-2 | 47 | 6.4 | 84 | 1 / 1 / 99 |
-| binary | 28 | 3.5 | 19.7 | 4 / 3 / 94 |
-| residual-4 `--backend rust` | 85 | – | **8.4** | 8 / 6 / 86 |
-| binary `--backend rust` | 28 | – | **8.2** | 11 / 8 / 82 |
+| exact | 610 (float corpus) | – | 20.0 | – |
+| residual-4 | 85 | 17 | 111 | 1 / 0 / 99 |
+| residual-2 | 47 | 6.5 | 82 | 1 / 1 / 99 |
+| residual-1 | 28 | 5.5 | 64 | 1 / 1 / 98 |
+| binary | 28 | 3.6 | 17.7 | 4 / 3 / 94 |
+| residual-4 `--backend rust` | 85 | – | **7.9** | 8 / 6 / 86 |
+| residual-2 `--backend rust` | 47 | – | **8.0** | 8 / 6 / 86 |
+| residual-1 `--backend rust` | 28 | – | 8.9 | 7 / 5 / 88 |
+| binary `--backend rust` | 28 | – | **6.2** | 10 / 7 / 82 |
 
 Two things the breakdown makes obvious. **Memory:** the binary index is 28 MB
 against a 610 MB float corpus — 22×. **Where the time goes:** thanks to
@@ -134,16 +142,21 @@ pruning made rescore the bottleneck; profile first, optimize the tall bar.
 The first release of this repo said `--backend rust` was **binary-only**,
 "because residual rescore is a `decode → BLAS matmul` and BLAS is already the
 fast path a hand kernel can't beat." True — and beside the point. You don't
-out-multiply BLAS; you stop feeding it. The [fused residual-4
-kernel](kernels/README.md) scores the 4-bit codes *directly* — the shared
-16-entry decode table is int8-quantized once, an in-register table lookup
-(NEON `tbl` / AVX2 `pshufb`) replaces decompression, and the centroid half of
-every dot product is a lookup into the matrix stage 1 already computed. The
-binary `2P − T` trick turns out to be the 1-bit special case of this LUT
-identity. Result: residual-4 drops 114 → 8.4 ms (**13.6×**) at a measured
-−0.0005 NDCG — the best-quality scheme now runs at binary speed, streaming
-68 B/token instead of the 512 B/token BLAS needed. residual-2 keeps the BLAS
-path (its 4-entry LUT is [exercise 5](kernels/README.md)).
+out-multiply BLAS; you stop feeding it. The [fused residual
+kernels](kernels/README.md) score the packed codes *directly* for every
+nbits ∈ {1, 2, 4} — the shared decode table is int8-quantized once, an
+in-register table lookup (NEON `tbl` / AVX2 `pshufb`) replaces decompression,
+and the centroid half of every dot product is a lookup into the matrix stage 1
+already computed. The binary `2P − T` trick turns out to be the 1-bit special
+case of this LUT identity (the 1-bit kernel needs no table at all: the affine
+form `(w₁−w₀)·P + w₀·T`). Result: residual-4 drops 111 → 7.9 ms (**14×**) at
+a measured −0.0005 NDCG and residual-2 drops 82 → 8.0 ms (**10×**) — the
+best-quality scheme now runs at binary speed, streaming 68 B/token instead of
+the 512 B/token BLAS needed. Note the fused family is nearly *nbits-flat* in
+latency (7.9 / 8.0 / 8.9 ms): the shared integer core and float fold dominate,
+not the payload bytes — which is also why residual-1 buys no speed with its
+smaller codes, while its quality collapse (see the table above) makes it a
+measured negative result worth reading, not running.
 
 **The knob that matters is `n_full`** — how many candidates get exact-rescored.
 Since rescore dominates, it's the recall/latency dial (binary, SciFact):
@@ -189,20 +202,22 @@ dispatch on `i8mm` cores — keep your negative results. Plus field notes on the
 three ways microbenchmarks lied to us while building the production version.
 See [kernels/README.md](kernels/README.md).
 
-There is a **second ladder** for residual-4: the same `2P − T` idea
-generalized to a 16-entry weight table (one in-register `tbl`/`pshufb` lookup
-replaces decompression), which retires this repo's original "you can't beat
-the BLAS path" claim — see [the profiling section](#profiling-evalpy---profile)
-and [kernels/README.md](kernels/README.md).
+There is a **second ladder** for the residual schemes: the same `2P − T` idea
+generalized to a shared weight table (one in-register `tbl`/`pshufb` lookup
+replaces decompression), covering nbits ∈ {1, 2, 4} — the 1-bit rung needs no
+table, just the affine form `(w₁−w₀)·P + w₀·T`. It retires this repo's
+original "you can't beat the BLAS path" claim — see
+[the profiling section](#profiling-evalpy---profile) and
+[kernels/README.md](kernels/README.md).
 
-A thin [pyo3 bridge](kernels/src/python.rs) exposes both dispatched kernels to
+A thin [pyo3 bridge](kernels/src/python.rs) exposes the dispatched kernels to
 numpy, so `eval.py --backend rust` scores stage-2 through them: binary via
-SDOT/AVX2-SAD (identical NDCG@10, 0.7460) and residual-4 via the fused LUT
-kernel (−0.0005 NDCG). Because centroid pruning makes rescore the dominant
-cost, swapping that one stage cuts SciFact end-to-end p50 to ~8 ms for both
-schemes — the kernels attack the tall bar instead of a rounding error.
-`kernels/test_bridge.py` pins the bridge to the numpy spec on every CI
-platform (x86 AVX2, Apple NEON, Neoverse NEON).
+SDOT/AVX2-SAD (identical NDCG@10, 0.7460) and the residual family via the
+fused LUT kernels (−0.0005 NDCG on residual-4). Because centroid pruning makes
+rescore the dominant cost, swapping that one stage cuts SciFact end-to-end p50
+to 6–9 ms for every scheme — the kernels attack the tall bar instead of a
+rounding error. `kernels/test_bridge.py` pins the bridge to the numpy spec on
+every CI platform (x86 AVX2, Apple NEON, Neoverse NEON).
 
 ## relationship to next-plaid
 
@@ -214,8 +229,8 @@ candidate generator, a different scoring identity — start here, measure with
 `eval.py`, and port to next-plaid when it wins. The binary quantization
 scheme here mirrors the one contributed to next-plaid in
 [PR #155](https://github.com/lightonai/next-plaid/pull/155); the fused
-residual-4 LUT kernel (114 → 8.4 ms here) is the next porting candidate —
-next-plaid's residual rescore is still `decompress → GEMM`.
+residual LUT kernels (111 → 7.9 ms here for nbits=4) are the next porting
+candidate — next-plaid's residual rescore is still `decompress → GEMM`.
 
 ## files
 

@@ -96,7 +96,7 @@
   <span class="eyebrow">class 04 · builds on classes 02–03 — <b>the GEMM bar, fusion, dot instructions</b></span>
   <h1>Retiring our own best advice.</h1>
   <p class="hero-sub">Class 02 ended with a rule: for 4-bit residual codes, <b>decompress and
-  let BLAS multiply — you won't beat it</b>. This class is the story of beating it 13.6× —
+  let BLAS multiply — you won't beat it</b>. This class is the story of beating it 14× —
   not by out-multiplying BLAS, but by generalizing class 03's one-bit identity to a
   <b>16-entry lookup table</b> and never materializing the floats at all. One worked example
   (the same 8-dim query as class 03) carries through; every number at the end is measured,
@@ -130,9 +130,9 @@
     <table>
       <tr><th>scheme</th><th>NDCG@10</th><th>retention</th><th>p50 / query</th><th>rescore path</th></tr>
       <tr><td class="mono">residual-4</td><td class="mono">0.7567</td><td class="mono">99.2%</td>
-          <td class="mono" style="color:var(--bad)">114 ms</td><td>decompress → BLAS GEMM (class 02's rung C)</td></tr>
+          <td class="mono" style="color:var(--bad)">111 ms</td><td>decompress → BLAS GEMM (class 02's rung C)</td></tr>
       <tr><td class="mono">binary + rust</td><td class="mono">0.7460</td><td class="mono">97.8%</td>
-          <td class="mono" style="color:var(--ok)">8.2 ms</td><td>fused SIMD, no decompression (class 03)</td></tr>
+          <td class="mono" style="color:var(--ok)">6.2 ms</td><td>fused SIMD, no decompression (class 03)</td></tr>
     </table>
   </div>
 
@@ -368,9 +368,9 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   <div class="tbl-wrap">
     <table>
       <tr><th>end to end · full SciFact</th><th>NDCG@10</th><th>p50 / query</th></tr>
-      <tr><td class="mono">residual-4, numpy (decompress → GEMM)</td><td class="mono">0.7567</td><td class="mono">114 ms</td></tr>
-      <tr><td class="mono">residual-4, fused LUT kernel</td><td class="mono">0.7562</td><td class="mono" style="color:var(--ok)"><b>8.4 ms — 13.6×</b></td></tr>
-      <tr><td class="mono">binary, fused kernel (reference)</td><td class="mono">0.7460</td><td class="mono">8.2 ms</td></tr>
+      <tr><td class="mono">residual-4, numpy (decompress → GEMM)</td><td class="mono">0.7567</td><td class="mono">111 ms</td></tr>
+      <tr><td class="mono">residual-4, fused LUT kernel</td><td class="mono">0.7562</td><td class="mono" style="color:var(--ok)"><b>7.9 ms — 14×</b></td></tr>
+      <tr><td class="mono">binary, fused kernel (reference)</td><td class="mono">0.7460</td><td class="mono">6.2 ms</td></tr>
     </table>
   </div>
   <p>Read the quality column carefully: the fused path costs <strong>−0.0005 NDCG</strong> —
@@ -407,7 +407,9 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
       <tr><td class="mono">binary (nbits=1)</td><td class="mono">{−1,+1}</td><td class="mono">16</td><td class="mono">0.7460</td>
           <td>✅ class 03's — the 1-bit <em>instance</em>: a bit mask replaces the lookup, the max stays integer</td></tr>
       <tr><td class="mono">residual-2</td><td class="mono">4 entries</td><td class="mono">32 + 4</td><td class="mono">0.7340</td>
-          <td>⬜ not yet — <a href="https://github.com/joe32140/nano-plaid/blob/main/kernels/README.md">exercise 5</a>: same <code>tbl</code>, a cheaper 2-bit unpack</td></tr>
+          <td>✅ implemented since this class first shipped — 82 → 8.0 ms (10×); the fused family is nbits-flat, so its only edge is index size</td></tr>
+      <tr><td class="mono">residual-1</td><td class="mono">{w₀, w₁} trained</td><td class="mono">16 + 4</td><td class="mono">0.6312</td>
+          <td>✅ implemented (affine form, no table) — and a <b>measured negative</b>: same 20 B budget as binary, 11 NDCG points worse</td></tr>
       <tr><td class="mono">residual-4</td><td class="mono">16 entries</td><td class="mono">64 + 4</td><td class="mono">0.7567</td>
           <td>✅ this class</td></tr>
     </table>
@@ -558,7 +560,7 @@ const CDOT=0.4183;
      note:"the mask IS the lookup; max stays integer"},
     {bits:2,name:"residual-2",table:"4 entries",bpt:"32 + 4 B",ndcg:"0.7340",
      idn:"Σ w·S over 4 buckets",
-     status:["ex","⬜ exercise 5"],
+     status:["done","✅ measured — see ch 09"],
      note:"same tbl, cheaper unpack — but read its NDCG first"},
     {bits:4,name:"residual-4",table:"16 entries",bpt:"64 + 4 B",ndcg:"0.7567",
      idn:"Σ w·S over 16 buckets + centroid",
@@ -664,7 +666,7 @@ const CDOT=0.4183;
      opts:["tbl is a slow instruction","The centroid term varies per token, so every (query row, token) score must fold to float before the max — binary kept the whole max in integers","4-bit unpacking defeats the prefetcher","AVX2 lacks a table-lookup instruction"],right:1,
      why:"Plus 4× the payload bytes. The float fold costs a horizontal add + two float ops per pair; binary's single shared scale let it defer all of that to the very end."},
     {q:"Does the LUT approach cover binary (1-bit), residual-2, and residual-4?",ch:"09",
-     opts:["Only residual-4 — the others need different algebra","The identity covers all three; kernels: binary already has its (better) specialized 1-bit form, residual-4 is implemented, residual-2 is exercise 5","All three run through one generic kernel in production","Only schemes with a centroid term"],right:1,
+     opts:["Only residual-4 — the others need different algebra","The identity covers all three; kernels: binary already has its (better) specialized 1-bit form, residual-4/-2/-1 are implemented — and residual-1 measured WORSE than binary at the same bytes","All three run through one generic kernel in production","Only schemes with a centroid term"],right:1,
      why:"The identity is universal (ch 05). But the 1-bit instance is *stronger* than the general kernel — mask instead of lookup, integer max — which is why class 03's kernel stays. residual-2 transfers directly; whether its quality earns a kernel is the exercise."}
   ];
   let answered=0,correct=0;
@@ -681,7 +683,7 @@ const CDOT=0.4183;
         if(oi===Qz.right){b.classList.add("right");correct++;}
         else{b.classList.add("wrong");opts.children[Qz.right].classList.add("right");}
         why.classList.add("show");
-        $("scoreLine").textContent="score: "+correct+" / "+answered+(answered===QS.length?(correct===QS.length?" — perfect. Exercise 5 has your name on it.":" — the chapter numbers point the way back."):"");
+        $("scoreLine").textContent="score: "+correct+" / "+answered+(answered===QS.length?(correct===QS.length?" — perfect. The fold-gap exercise has your name on it.":" — the chapter numbers point the way back."):"");
       });
       opts.append(b);
     });
