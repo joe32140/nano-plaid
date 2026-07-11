@@ -50,13 +50,20 @@ SMMLA wherever `i8mm` exists — a measured ~1% giveback on the M4 bought a
 benching it on more than one microarchitecture, is the whole lesson.
 
 Indicative per-platform numbers from CI's shared runners (one run, ratios >
-absolutes; M4 numbers above are from an idle local machine):
+absolutes; M4 numbers above are from an idle local machine). µs/doc:
 
-| platform | binary fused | residual-4 fused | SMMLA |
-|----------|-------------:|-----------------:|------:|
-| x86_64 AVX2 (ubuntu-latest) | 7.91 µs/doc (28×) | 13.1 µs/doc (17×) | – |
-| Apple M1 (macos-latest) | 2.66 µs/doc (56×) | 7.07 µs/doc (21×) | no i8mm |
-| Neoverse N2 (ubuntu-24.04-arm) | 4.85 µs/doc (32×) | 8.47 µs/doc (18×) | **3.46 µs/doc (45×)** |
+| platform | binary | r4 | r2 | r1 | SMMLA |
+|----------|-------:|---:|---:|---:|------:|
+| x86_64 AVX2 (ubuntu-latest) | 7.4 | 12.9 | 12.9 | 11.0 | – |
+| Apple M1 (macos-latest) | 2.6 | 6.6 | 6.6 | 8.7 | no i8mm |
+| Neoverse N2 (ubuntu-24.04-arm) | 4.9 | 8.5 | 8.5 | 9.6 | **3.5** |
+
+The nbits-flat pattern replicates on every microarchitecture — r4 and r2 are
+within noise of each other on all three. One platform-specific inversion: on
+AVX2, r1 is the *fastest* residual rung (its affine form rides the masked-SAD
+machinery, cheaper than the shufb + sign-transfer chain), while on both ARM
+cores r1 is the slowest. Same source, three CPUs, three different orderings —
+the recurring moral of this crate.
 
 ## the math
 
