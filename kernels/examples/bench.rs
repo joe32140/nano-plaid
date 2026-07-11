@@ -75,6 +75,18 @@ fn main() {
         std::arch::is_aarch64_feature_detected!("dotprod"),
         std::arch::is_aarch64_feature_detected!("i8mm")
     );
+    // AVX-512 VNNI is a per-run lottery on shared CI runners (Intel Xeon draws
+    // have it, AMD EPYC draws don't), so print what THIS machine detected — it
+    // tells you whether the avx512 rows below actually ran the fused kernel.
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "x86_64: avx2={} avx512f={} avx512bw={} avx512vl={} avx512vnni={}\n",
+        std::arch::is_x86_feature_detected!("avx2"),
+        std::arch::is_x86_feature_detected!("avx512f"),
+        std::arch::is_x86_feature_detected!("avx512bw"),
+        std::arch::is_x86_feature_detected!("avx512vl"),
+        std::arch::is_x86_feature_detected!("avx512vnni"),
+    );
 
     let t1 = best_of(|| docs_f32.iter().map(|d| maxsim_f32(&q_deq, d, DIM)).sum());
     let t2 = best_of(|| docs.iter().map(|b| maxsim_scalar(&q, b, DIM)).sum());
@@ -88,6 +100,13 @@ fn main() {
         .map(|_| best_of(|| docs.iter().map(|b| maxsim_smmla(&q, b, DIM).unwrap()).sum()));
     let t_avx2 = maxsim_avx2(&q, &docs[0], DIM)
         .map(|_| best_of(|| docs.iter().map(|b| maxsim_avx2(&q, b, DIM).unwrap()).sum()));
+    let t_avx512 = maxsim_avx512(&q, &docs[0], DIM).map(|_| {
+        best_of(|| {
+            docs.iter()
+                .map(|b| maxsim_avx512(&q, b, DIM).unwrap())
+                .sum()
+        })
+    });
 
     let us = |d: Duration| d.as_secs_f64() * 1e6 / N_DOCS as f64;
     let rel = |d: Duration| t1.as_secs_f64() / d.as_secs_f64();
@@ -103,6 +122,7 @@ fn main() {
         ("rung 4  fused NEON SDOT ", t_sdot),
         ("rung 5  fused NEON SMMLA", t_smmla),
         ("rung 4  fused AVX2 SAD  ", t_avx2),
+        ("rung 6  fused AVX512VNNI", t_avx512),
     ] {
         if let Some(t) = t {
             line(name, t);
@@ -115,6 +135,12 @@ fn main() {
     if let (Some(a), Some(b)) = (t_sdot, t_smmla) {
         println!(
             "\n  SMMLA vs SDOT: {:.2}x",
+            a.as_secs_f64() / b.as_secs_f64()
+        );
+    }
+    if let (Some(a), Some(b)) = (t_avx2, t_avx512) {
+        println!(
+            "\n  AVX512 VNNI vs AVX2 SAD: {:.2}x",
             a.as_secs_f64() / b.as_secs_f64()
         );
     }
@@ -267,4 +293,25 @@ fn main() {
     time_tr!(r4_codes, maxsim_r4_tr_fused, "r4      + transpose-reduce");
     time_tr!(r2_codes, maxsim_r2_tr_fused, "r2      + transpose-reduce");
     time_tr!(r1_codes, maxsim_r1_tr_fused, "r1      + transpose-reduce");
+
+    // The AVX-512 VNNI residual rungs (x86 with VNNI only; `time_tr!` reused
+    // verbatim — same shape, same skip-if-None gate). r4/r2 are the 256-bit
+    // `vpdpbusd` upgrade of the AVX2 pshufb rung; r1 is the full-512-bit twin of
+    // the binary kernel with the affine tail. Compare against the AVX2 + vec
+    // fold rows above on the same runner.
+    time_tr!(
+        r4_codes,
+        maxsim_r4_avx512_fused,
+        "r4      + AVX512 VNNI     "
+    );
+    time_tr!(
+        r2_codes,
+        maxsim_r2_avx512_fused,
+        "r2      + AVX512 VNNI     "
+    );
+    time_tr!(
+        r1_codes,
+        maxsim_r1_avx512_fused,
+        "r1      + AVX512 VNNI     "
+    );
 }

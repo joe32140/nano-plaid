@@ -1867,6 +1867,319 @@ mod x86 {
         }
         best.iter().sum()
     }
+
+    // =======================================================================
+    // AVX-512 VNNI: the fused kernel for x86 SERVERS (Intel Cascade/Ice Lake
+    // Xeon, AMD Zen 4+). `vpdpbusd` is the exact x86 twin of NEON's SDOT — one
+    // instruction does a u8×i8 dot-accumulate into i32 lanes (four MACs per
+    // 32-bit lane), collapsing AVX2's `pmaddubsw`+`pmaddwd`+`paddd` int8-dot
+    // chain to a single op. The binary/residual-1 kernels are the port of
+    // next-plaid's production `maxsim_vnni`.
+    //
+    // Unlike AVX2's masked-SAD (which leans on `psadbw` because pre-VNNI x86
+    // has no cheap signed int8 dot), VNNI scores the direct way NEON SDOT does:
+    // the 1-bit doc becomes a 0/1 mask (u8), dotted against the SIGNED int8
+    // query, so `P = Σ_{bit=1} q` needs no biased-SAD detour. `score = 2P − T`.
+    //
+    // The doc-token TRANSPOSE and the vectorized FOLD both live in the binary
+    // kernel: 4 doc tokens are scored per query row at once (one `vpdpbusd`
+    // accumulator each), and the per-query running max stays in a register
+    // (`pmaxsd` over the 4 doc-slot lanes) — the integer-max form of the fold.
+    // It mirrors `maxsim_neon128`'s block-of-4 SDOT loop op-for-op. The residual
+    // kernels can't use the integer max (their per-token centroid term forces a
+    // float fold), so they carry the family's wide fold instead: 16 query rows
+    // per `_mm512_max_ps` in `fold_block_avx512`.
+
+    // Replicate each of a packed u64's 8 bytes across its 8 lanes, then MSB-first
+    // bit-test vs VSEL -> a zmm of 0/1 bytes (dims 8k..8k+8 from packed byte k),
+    // matching `binarize`. The 512-bit twin of the AVX2 IDX/SEL. Shared by the
+    // VNNI binary and residual-1 kernels.
+    const VIDX: [i8; 64] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7,
+        7, 7, 7, 7,
+    ];
+    const VSEL: [i8; 64] = [
+        -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02,
+        0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04,
+        0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08,
+        0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10,
+        0x08, 0x04, 0x02, 0x01,
+    ];
+
+    /// The residual family's float fold, vectorized 16 query rows per
+    /// `_mm512_max_ps` — the AVX-512 twin of `fold_block` (AVX2, 8 rows). Same
+    /// bit-exactness contract as that helper: `_mm512_cvtepi32_ps` matches
+    /// `acc as f32`, the multiply and add stay SEPARATE (no FMA) so the two
+    /// roundings match `sqw*acc + crow`, and `_mm512_max_ps(b, s)` returns its
+    /// second operand on ties — matching the scalar `if s > best` select for the
+    /// finite scores this loop produces.
+    ///
+    /// # Safety
+    /// Requires `avx512f`. `accs`, `sqw`, `best` share length; `crow` is valid
+    /// for that length.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn fold_block_avx512(accs: &[i32], sqw: &[f32], crow: *const f32, best: &mut [f32]) {
+        let nq = accs.len();
+        let mut i = 0;
+        while i + 16 <= nq {
+            let a = _mm512_cvtepi32_ps(_mm512_loadu_si512(accs.as_ptr().add(i) as *const __m512i));
+            let sw = _mm512_loadu_ps(sqw.as_ptr().add(i));
+            let s = _mm512_add_ps(_mm512_mul_ps(sw, a), _mm512_loadu_ps(crow.add(i)));
+            let b = _mm512_loadu_ps(best.as_ptr().add(i));
+            _mm512_storeu_ps(best.as_mut_ptr().add(i), _mm512_max_ps(b, s));
+            i += 16;
+        }
+        while i < nq {
+            let s = sqw[i] * accs[i] as f32 + *crow.add(i);
+            if s > best[i] {
+                best[i] = s;
+            }
+            i += 1;
+        }
+    }
+
+    /// # Safety
+    /// Requires `avx512f,avx512bw,avx512vnni`; dim == 128; `bits.len() == n_d*16`.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    pub unsafe fn maxsim_avx512_vnni_128(q: &super::QueryI8, bits: &[u8]) -> f32 {
+        let n_q = q.sums.len();
+        let n_d = bits.len() / 16;
+        let idx = _mm512_loadu_si512(VIDX.as_ptr() as *const __m512i);
+        let sel = _mm512_loadu_si512(VSEL.as_ptr() as *const __m512i);
+        let one = _mm512_set1_epi8(1);
+
+        // Expand one group's 64 packed sign bits into a zmm of 0/1 bytes.
+        macro_rules! expand {
+            ($w:expr) => {{
+                let bc = _mm512_set1_epi64($w as i64);
+                let k = _mm512_test_epi8_mask(_mm512_shuffle_epi8(bc, idx), sel);
+                _mm512_maskz_mov_epi8(k, one)
+            }};
+        }
+        // Sum a zmm's 16 i32 lanes down to an xmm of 4 partial lanes.
+        macro_rules! fold4 {
+            ($a:expr) => {{
+                let y =
+                    _mm256_add_epi32(_mm512_castsi512_si256($a), _mm512_extracti64x4_epi64($a, 1));
+                _mm_add_epi32(_mm256_castsi256_si128(y), _mm256_extracti128_si256(y, 1))
+            }};
+        }
+
+        // Per query token a 4-lane running max, one lane per doc slot of the
+        // block. Tail blocks repeat the last token — repeats cannot change a max.
+        let mut best = vec![i32::MIN; n_q * 4];
+        let qp = q.values.as_ptr();
+        let mut db = 0usize;
+        while db < n_d {
+            let mut masks = [[_mm512_setzero_si512(); 2]; 4];
+            for (t, m) in masks.iter_mut().enumerate() {
+                let d = (db + t).min(n_d - 1);
+                let row = bits.as_ptr().add(d * 16);
+                m[0] = expand!((row as *const u64).read_unaligned());
+                m[1] = expand!((row.add(8) as *const u64).read_unaligned());
+            }
+            for (qi, &sum) in q.sums.iter().enumerate() {
+                let qrow = qp.add(qi * 128);
+                let q0 = _mm512_loadu_si512(qrow as *const __m512i);
+                let q1 = _mm512_loadu_si512(qrow.add(64) as *const __m512i);
+                let mut acc = [_mm512_setzero_si512(); 4];
+                for (a, m) in acc.iter_mut().zip(&masks) {
+                    *a = _mm512_dpbusd_epi32(*a, m[0], q0);
+                    *a = _mm512_dpbusd_epi32(*a, m[1], q1);
+                }
+                // [P0, P1, P2, P3] for the 4 doc tokens of this block.
+                let h01 = _mm_hadd_epi32(fold4!(acc[0]), fold4!(acc[1]));
+                let h23 = _mm_hadd_epi32(fold4!(acc[2]), fold4!(acc[3]));
+                let p4 = _mm_hadd_epi32(h01, h23);
+                let sc = _mm_sub_epi32(_mm_slli_epi32::<1>(p4), _mm_set1_epi32(sum));
+                let bp = best.as_mut_ptr().add(qi * 4) as *mut __m128i;
+                _mm_storeu_si128(bp, _mm_max_epi32(_mm_loadu_si128(bp), sc));
+            }
+            db += 4;
+        }
+        let mut total = 0.0f32;
+        for (qi, &scale) in q.scales.iter().enumerate() {
+            let m = *best[qi * 4..qi * 4 + 4].iter().max().unwrap();
+            total += m as f32 * scale;
+        }
+        total
+    }
+
+    /// Fused residual-1 on AVX-512 VNNI: `P = q · bits` comes from the same
+    /// mask-expand + `vpdpbusd` as the binary kernel, then the affine tail
+    /// `acc = (w1−w0)·P + w0·T` (see the NEON residual-1 comment) and the
+    /// family's wide float fold. Uses `q.values` directly — zero new layouts.
+    ///
+    /// # Safety
+    /// Requires `avx512f,avx512bw,avx512vnni`; dim == 128;
+    /// `codes.len() == cids.len() * 16`; every cid indexes a `cdot_t` row.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    pub unsafe fn maxsim_r1_avx512_128(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let dw = lut.values[1] as i32 - lut.values[0] as i32;
+        let w0 = lut.values[0] as i32;
+        let idx = _mm512_loadu_si512(VIDX.as_ptr() as *const __m512i);
+        let sel = _mm512_loadu_si512(VSEL.as_ptr() as *const __m512i);
+        let one = _mm512_set1_epi8(1);
+        macro_rules! expand {
+            ($w:expr) => {{
+                let bc = _mm512_set1_epi64($w as i64);
+                let k = _mm512_test_epi8_mask(_mm512_shuffle_epi8(bc, idx), sel);
+                _mm512_maskz_mov_epi8(k, one)
+            }};
+        }
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        let qp = q.values.as_ptr();
+        for (d, &cid) in cids.iter().enumerate() {
+            let row = codes.as_ptr().add(d * 16);
+            let m0 = expand!((row as *const u64).read_unaligned());
+            let m1 = expand!((row.add(8) as *const u64).read_unaligned());
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qrow = qp.add(qi * 128);
+                let mut a = _mm512_setzero_si512();
+                a = _mm512_dpbusd_epi32(a, m0, _mm512_loadu_si512(qrow as *const __m512i));
+                a = _mm512_dpbusd_epi32(a, m1, _mm512_loadu_si512(qrow.add(64) as *const __m512i));
+                let p = _mm512_reduce_add_epi32(a);
+                *acc_qi = dw * p + w0 * q.sums[qi];
+            }
+            fold_block_avx512(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
+        }
+        best.iter().sum()
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused residual-4/2 on AVX-512 VNNI. The pshufb LUT path was laid out for
+    // 256-bit lanes (perm4/perm2), so its VNNI upgrade stays 256-bit: one
+    // `_mm256_dpbusd_epi32` (needs avx512vl) replaces AVX2's `pmaddubsw` +
+    // `pmaddwd` + `paddd` int8-dot triple per group — same operands (|q| as the
+    // unsigned byte, the sign-transferred weight as the signed byte), one µop.
+    // The wide `_mm512_max_ps` fold still applies across query rows.
+
+    // ymm of 8 i32 lanes -> scalar sum (the AVX2 residual reduce, reused).
+    macro_rules! hsum256 {
+        ($acc:expr) => {{
+            let x = _mm_add_epi32(
+                _mm256_castsi256_si128($acc),
+                _mm256_extracti128_si256($acc, 1),
+            );
+            let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+            let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
+            _mm_cvtsi128_si32(x)
+        }};
+    }
+
+    /// # Safety
+    /// Requires `avx512f,avx512vl,avx512vnni`; `q.perm4`/`q.absq4` populated
+    /// (dim == 128); `codes.len() == cids.len() * 64`; cids index `cdot_t`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni")]
+    pub unsafe fn maxsim_r4_avx512_128(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.values.as_ptr() as *const __m128i));
+        let low4 = _mm256_set1_epi8(0x0F);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = _mm256_loadu_si256(cp as *const __m256i);
+            let v1 = _mm256_loadu_si256(cp.add(32) as *const __m256i);
+            let w = [
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v0, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v0, low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v1, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v1, low4)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qs = q.perm4.as_ptr().add(qi * 128);
+                let qa = q.absq4.as_ptr().add(qi * 128);
+                let mut acc = _mm256_setzero_si256();
+                for (g, &wg) in w.iter().enumerate() {
+                    let sign_src = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                    let mag = _mm256_loadu_si256(qa.add(g * 32) as *const __m256i);
+                    let ws = _mm256_sign_epi8(wg, sign_src); // w·sign(q), 0 where q=0
+                    acc = _mm256_dpbusd_epi32(acc, mag, ws); // |q|·ws, one µop
+                }
+                *acc_qi = hsum256!(acc);
+            }
+            fold_block_avx512(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
+        }
+        best.iter().sum()
+    }
+
+    /// # Safety
+    /// Requires `avx512f,avx512vl,avx512vnni`; `q.perm2`/`q.absq2` populated
+    /// (dim == 128); `codes.len() == cids.len() * 32`; cids index `cdot_t`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni")]
+    pub unsafe fn maxsim_r2_avx512_128(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.values.as_ptr() as *const __m128i));
+        let two = _mm256_set1_epi8(0x03);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut accs = vec![0i32; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 32);
+            let v = _mm256_loadu_si256(cp as *const __m256i);
+            let w = [
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 6), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 4), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v, 2), two)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v, two)),
+            ];
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qs = q.perm2.as_ptr().add(qi * 128);
+                let qa = q.absq2.as_ptr().add(qi * 128);
+                let mut acc = _mm256_setzero_si256();
+                for (g, &wg) in w.iter().enumerate() {
+                    let sign_src = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                    let mag = _mm256_loadu_si256(qa.add(g * 32) as *const __m256i);
+                    let ws = _mm256_sign_epi8(wg, sign_src);
+                    acc = _mm256_dpbusd_epi32(acc, mag, ws);
+                }
+                *acc_qi = hsum256!(acc);
+            }
+            fold_block_avx512(
+                &accs,
+                &sqw,
+                cdot_t.as_ptr().add(cid as usize * nq),
+                &mut best,
+            );
+        }
+        best.iter().sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,11 +2203,44 @@ pub fn maxsim(q: &QueryI8, bits: &[u8], dim: usize) -> f32 {
     if let Some(v) = maxsim_sdot(q, bits, dim) {
         return v;
     }
+    // AVX-512 VNNI first where present: `vpdpbusd` fuses the int8 dot AVX2 has
+    // to build from `psadbw`, and its 4-doc-token transpose keeps the fold in a
+    // register. Cascade/Ice Lake Xeon and Zen 4+ have it; older/AMD-Zen3 x86
+    // and the E-cores Intel shipped after Alder Lake do not, so AVX2 stays the
+    // universal x86 floor (this is why `-C target-cpu=native` can't be shipped).
+    #[cfg(target_arch = "x86_64")]
+    if let Some(v) = maxsim_avx512(q, bits, dim) {
+        return v;
+    }
     #[cfg(target_arch = "x86_64")]
     if let Some(v) = maxsim_avx2(q, bits, dim) {
         return v;
     }
     maxsim_autovec(q, bits, dim)
+}
+
+/// True when this CPU has the AVX-512 subset the VNNI kernels need (F for the
+/// zmm plumbing, BW for the byte shuffle/mask, VNNI for `vpdpbusd`). All three
+/// arrived together on Cascade Lake / Ice Lake and Zen 4, but the detection is
+/// per-feature because Intel has shipped F-without-VNNI parts (Skylake-X) and
+/// fused AVX-512 off entirely on hybrid consumer chips.
+#[cfg(target_arch = "x86_64")]
+fn has_avx512_vnni() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+
+/// The AVX-512 VNNI binary kernel if this CPU supports it and `dim == 128`,
+/// else `None`. Preferred over `maxsim_avx2` in `maxsim`; exposed so the bench
+/// and parity tests can drive it head-to-head with the AVX2 SAD rung.
+#[allow(unused_variables)]
+pub fn maxsim_avx512(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if dim == 128 && !q.values.is_empty() && has_avx512_vnni() {
+        return Some(unsafe { x86::maxsim_avx512_vnni_128(q, bits) });
+    }
+    None
 }
 
 /// Rung 4 (fused NEON SDOT) if this CPU has `dotprod` and `dim == 128`, else
@@ -1940,6 +2286,9 @@ pub fn maxsim_avx2(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
 /// bit-identical; `maxsim_r4_fused`/`_vfold_fused`/`_tr_fused` stay exposed for
 /// the head-to-head bench.
 pub fn maxsim_r4(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r4_avx512_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r4_tr_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -1976,6 +2325,9 @@ pub fn maxsim_r4_fused(
 /// Fused residual-2 MaxSim over one doc: dispatched exactly like `maxsim_r4`
 /// (transpose-reduce on NEON, then vfold, then scalar-fold, then scalar).
 pub fn maxsim_r2(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r2_avx512_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r2_tr_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -2011,6 +2363,9 @@ pub fn maxsim_r2_fused(
 /// Fused residual-1 MaxSim over one doc: dispatched exactly like `maxsim_r4`
 /// (transpose-reduce on NEON, then vfold, then scalar-fold, then scalar).
 pub fn maxsim_r1(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r1_avx512_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
     if let Some(v) = maxsim_r1_tr_fused(q, lut, codes, cids, cdot_t) {
         return v;
     }
@@ -2120,6 +2475,70 @@ pub fn maxsim_r1_tr_fused(
     None
 }
 
+// The AVX-512 VNNI residual accessors (x86 only). Preferred over the AVX2 rungs
+// in the shipping dispatchers where the CPU has VNNI; `None` on aarch64 (the
+// NEON tr/vfold path wins there) and on x86 without VNNI (falls to AVX2 vfold).
+// r1 rides `q.values` (the affine identity needs no residual-specific layout);
+// r4/r2 reuse the AVX2 `perm4`/`perm2` layouts — one `vpdpbusd` replaces AVX2's
+// three-op int8 dot, so the upgrade is a drop-in on the same query bytes.
+
+/// The AVX-512 VNNI residual-4 kernel, if this CPU has VNNI. `None` elsewhere.
+#[allow(unused_variables)]
+pub fn maxsim_r4_avx512_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128
+        && !q.perm4.is_empty()
+        && has_avx512_vnni()
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return Some(unsafe { x86::maxsim_r4_avx512_128(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The AVX-512 VNNI residual-2 kernel, if this CPU has VNNI. `None` elsewhere.
+#[allow(unused_variables)]
+pub fn maxsim_r2_avx512_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128
+        && !q.perm2.is_empty()
+        && has_avx512_vnni()
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return Some(unsafe { x86::maxsim_r2_avx512_128(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
+/// The AVX-512 VNNI residual-1 kernel (full 512-bit zmm), if this CPU has VNNI.
+/// `None` elsewhere.
+#[allow(unused_variables)]
+pub fn maxsim_r1_avx512_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128 && !q.values.is_empty() && has_avx512_vnni() {
+        return Some(unsafe { x86::maxsim_r1_avx512_128(q, lut, codes, cids, cdot_t) });
+    }
+    None
+}
+
 /// The fold-vectorized fused residual-2 kernel, if this CPU has it.
 #[allow(unused_variables)]
 pub fn maxsim_r2_vfold_fused(
@@ -2212,6 +2631,12 @@ mod tests {
             if let Some(v) = maxsim_avx2(&q, &bits, dim) {
                 assert_eq!(a, v, "avx2 ({nq},{nd},{dim})");
             }
+            // Runs only when CI draws an AVX-512-VNNI x86 runner (Intel Ice/
+            // Cascade Lake, AMD Zen 4); a no-op skip on aarch64 and AVX2-only
+            // x86 — the same runtime-detection gate as SMMLA/SDOT above.
+            if let Some(v) = maxsim_avx512(&q, &bits, dim) {
+                assert_eq!(a, v, "avx512 ({nq},{nd},{dim})");
+            }
         }
     }
 
@@ -2280,6 +2705,13 @@ mod tests {
         // built to preserve it (separate mul+add, not FMA; vector max == the
         // scalar select for finite scores). Same contract for every nbits rung.
         for &(nbits, scalar, dispatched, fused, vfold) in &R_FAMILY {
+            // The AVX-512 VNNI accessor for this rung (runs only when CI draws a
+            // VNNI-capable x86 runner; `None` everywhere else — see the tr test).
+            let avx512: RFused = match nbits {
+                4 => maxsim_r4_avx512_fused,
+                2 => maxsim_r2_avx512_fused,
+                _ => maxsim_r1_avx512_fused,
+            };
             for &(nq, nd) in &[(32, 80), (7, 3), (1, 1)] {
                 let (q, lut, codes, cids, cdot_t) = setup_r(nq, nd, 128, 16, nbits, 99 + nd as u64);
                 let a = scalar(&q, &lut, &codes, &cids, &cdot_t);
@@ -2294,11 +2726,15 @@ mod tests {
                 if let Some(v) = vfold(&q, &lut, &codes, &cids, &cdot_t) {
                     assert_eq!(a, v, "vfold (nbits={nbits}, {nq},{nd})");
                 }
+                if let Some(v) = avx512(&q, &lut, &codes, &cids, &cdot_t) {
+                    assert_eq!(a, v, "avx512 (nbits={nbits}, {nq},{nd})");
+                }
             }
             // Non-128 dims must fall back to the scalar rung, not crash.
             let (q, lut, codes, cids, cdot_t) = setup_r(3, 5, 64, 8, nbits, 7);
             assert!(fused(&q, &lut, &codes, &cids, &cdot_t).is_none());
             assert!(vfold(&q, &lut, &codes, &cids, &cdot_t).is_none());
+            assert!(avx512(&q, &lut, &codes, &cids, &cdot_t).is_none());
             assert_eq!(
                 dispatched(&q, &lut, &codes, &cids, &cdot_t),
                 scalar(&q, &lut, &codes, &cids, &cdot_t)
