@@ -20,9 +20,13 @@ faster, all returning **bit-identical** scores:
 
 **On x86_64** rung 4 is `maxsim_avx2_sad128` (AVX2 masked-SAD) instead of NEON
 SDOT — same fused doc-token-outer idea, same bit-identical scores, AVX2-only so
-it runs on essentially any Linux/x86 machine. The bench prints whichever fused
-kernel your CPU supports; the dispatcher (`maxsim`) picks it automatically, so
-`eval.py --backend rust` accelerates binary scoring on x86 too.
+it runs on essentially any Linux/x86 machine. **Rung 6** (`maxsim_avx512_vnni_128`)
+is the server upgrade: `vpdpbusd` is SDOT's exact x86 twin — one instruction for
+the u8×i8 dot AVX2 has to fake with `psadbw` — so on a VNNI core (Cascade/Ice
+Lake Xeon, Zen 4+) it runs the binary kernel **2.09× faster** than AVX2 (3.8 vs
+7.9 µs/doc, Ice Lake CI). The bench prints whichever fused kernel your CPU
+supports; the dispatcher (`maxsim`) prefers AVX-512 → AVX2 → autovec at runtime,
+so `eval.py --backend rust` picks the fastest available automatically.
 
 Read the table before the code: **the algebraic identity is not the speedup.**
 Rung 2 is *slower* than the float loop it replaces — branching per bit costs
@@ -67,6 +71,12 @@ binary kernel (7.4)** — its affine form rides the cheap masked-SAD path, which
 on x86 undercuts both the shufb chain and binary's own SAD loop. On both ARM
 cores r1 stays the slowest residual rung. Same source, three CPUs, different
 orderings — the recurring moral of this crate.
+
+On a fourth CPU — an x86 server with AVX-512 VNNI — the binary kernel jumps
+another **2.09×** over the AVX2 row above, while the residual rungs gain only
+~1.1×; why the same ISA pays off so unevenly across the family is exercise 2
+below (`vpdpbusd`, full-width vs layout-bound), along with how the CI verifies a
+kernel on hardware GitHub's runners only sometimes have.
 
 ## the math
 
@@ -208,10 +218,47 @@ Each has a production answer in
 
 1. **Portable SIMD** — rewrite rung 3 with nightly `std::simd`. How close to
    rung 4 can a platform-independent kernel get?
-2. **AVX-512 VNNI** — `vpdpbusd` is SDOT's exact x86 cousin, faster than the
-   AVX2 rung where a CPU has it. Port `maxsim_vnni128` from next-plaid and add
-   it above AVX2 in the dispatch. (Less universal, which is why AVX2 is the
-   shipped x86 kernel and this is the exercise.)
+2. **AVX-512 VNNI** *(answered in-tree — `maxsim_avx512_vnni_128` and the three
+   `maxsim_r{4,2,1}_avx512_128` rungs now ship, above AVX2 in the dispatch).*
+   `vpdpbusd` is SDOT's exact x86 cousin: one instruction for the u8×i8
+   dot-accumulate AVX2 has to build from `psadbw` (binary) or
+   `pmaddubsw`+`pmaddwd`+`paddd` (residual). Ported from next-plaid's production
+   `maxsim_vnni`. The measured wins are a lesson in what "use AVX-512" actually
+   buys you — it is **not** uniformly 2× (Ice Lake CI draw, µs/doc, vs the
+   *shipping* AVX2 rung, ratios > absolutes):
+
+   | rung | AVX2 (ships) | AVX-512 VNNI | speedup | why |
+   |------|-------------:|-------------:|--------:|-----|
+   | binary | 7.9 (SAD) | **3.8** | **2.09×** | full 512-bit zmm + integer-max fold |
+   | r1 | 6.7 (vfold) | **5.9** | 1.14× | full zmm, but float fold + per-row reduce |
+   | r2 | 7.4 (vfold) | **6.7** | 1.11× | 256-bit — layout-bound |
+   | r4 | 7.4 (vfold) | **6.9** | 1.08× | 256-bit — layout-bound |
+
+   The binary kernel gets the clean 2×: it doubles the vector width AND keeps
+   everything integer, so the 4-doc-token transpose folds the running max in a
+   register (`pmaxsd`, no float detour) — the exact port of next-plaid's kernel.
+   The residual family can't: its per-token centroid term forces a **float**
+   fold, so it carries the family's wide fold (16 rows per `_mm512_max_ps`)
+   instead. And r4/r2 stay **256-bit** — their `pshufb`-LUT layout (`perm4`/
+   `perm2`) is bound to 128-bit lanes, so widening would need a whole new query
+   permutation; VNNI still helps by fusing the three-op int8 dot into one
+   `_mm256_dpbusd`, but only the µop count drops, not the width — hence ~1.1×.
+   r1 goes full-512 (it rides `q.values`, no LUT), but the `_mm512_reduce_add`
+   per row plus the float fold claw back most of the width win (1.14×) — the
+   same "the horizontal reduce is a real cost" finding as the NEON
+   transpose-reduce in exercise 5, now on x86.
+
+   The second lesson is about **testing an ISA your CI hardware may not have.**
+   GitHub's shared `ubuntu-latest` is a coin flip: an Intel Ice Lake draw has
+   VNNI, an AMD EPYC draw does not — so the `rust` job's `if let Some(v) =
+   maxsim_avx512(…)` parity checks pass *vacuously* on an AMD draw, running
+   nothing (the Rosetta trap from the field notes, wearing an x86 hat). The fix
+   is a dedicated `avx512-emulated` CI job that runs the suite under **Intel
+   SDE** emulating an Ice Lake core, so runtime feature detection reports VNNI
+   and the kernels execute *deterministically every run*; a guard test gated on
+   `NANOPLAID_REQUIRE_AVX512` turns "emulator didn't expose VNNI" from a false
+   pass into a loud failure. Correctness comes from SDE (every run); the real
+   µs/doc above come from whichever runs happen to draw Intel silicon.
 3. **Other dims** — rung 4 hardcodes dim=128. Generalize to any multiple of
    32; measure what zero-padding dim=48 to 64 costs vs the fallback.
 4. **Store the expansion?** Precompute each doc token's 128 expanded bytes at

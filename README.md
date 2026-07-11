@@ -218,17 +218,22 @@ Two honest observations, both of which are the point of the repo:
 ## the kernel ladder (`kernels/`)
 
 The one inner loop that matters — int8 query × packed 1-bit docs MaxSim —
-rebuilt in Rust as five rungs, from scalar reference to a fused SIMD kernel
-(NEON SDOT on Apple Silicon, AVX2 masked-SAD on x86/Linux), all bit-identical,
+rebuilt in Rust as a ladder of rungs, from scalar reference to a fused SIMD
+kernel (NEON SDOT on Apple Silicon, AVX2 masked-SAD or AVX-512 VNNI on
+x86/Linux), all bit-identical,
 benchmarked on the way up (spoiler: the algebraic identity alone makes things
 *slower*; the memory layout and loop order are the speedup — 38× by rung 4).
 Rung 5 swaps SDOT for the denser SMMLA matrix instruction, which *should* be
 2× and instead ties on the M4 — a measured lesson in why you don't trust a MAC
 count without running it. The epilogue is better: CI's Neoverse arm64 runner
 later proved SMMLA **1.40× faster** there, so the "failed" rung now wins the
-dispatch on `i8mm` cores — keep your negative results. Plus field notes on the
-three ways microbenchmarks lied to us while building the production version.
-See [kernels/README.md](kernels/README.md).
+dispatch on `i8mm` cores — keep your negative results. Rung 6 is the x86 server
+upgrade: AVX-512 **VNNI** (`vpdpbusd`, SDOT's exact x86 twin) runs the binary
+kernel **2.09×** over AVX2 where a CPU has it — but only ~1.1× for the residual
+rungs, a clean lesson in when doubling the vector width actually pays (and, since
+GitHub's runners only *sometimes* have AVX-512, how to verify it deterministically
+under Intel SDE). Plus field notes on the three ways microbenchmarks lied to us
+while building the production version. See [kernels/README.md](kernels/README.md).
 
 There is a **second ladder** for the residual schemes: the same `2P − T` idea
 generalized to a shared weight table (one in-register `tbl`/`pshufb` lookup

@@ -440,6 +440,37 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   on the M4 wins <strong>1.40×</strong> on Neoverse, so the dispatcher now prefers it wherever
   <code>i8mm</code> exists. Measure on more than one microarchitecture; keep your negative
   results.</p>
+
+  <div class="callout">
+    <p><b>A fourth CPU, and a warning about "just use AVX-512."</b> On an x86 server with
+    <b>AVX-512 VNNI</b>, one <code>vpdpbusd</code> does the u8×i8 dot AVX2 fakes with
+    <code>psadbw</code> — SDOT's exact x86 twin. It does <em>not</em> speed every rung equally:</p>
+    <div class="tbl-wrap">
+      <table>
+        <tr><th>Ice Lake Xeon <span class="pill">CI</span></th><th>AVX2 (ships)</th><th>AVX-512 VNNI</th><th>speedup</th></tr>
+        <tr><td class="mono">binary</td><td class="mono">7.9 µs/doc</td><td class="mono"><b>3.8</b></td><td class="mono" style="color:var(--ok)"><b>2.09×</b></td></tr>
+        <tr><td class="mono">residual-1</td><td class="mono">6.7 (vfold)</td><td class="mono"><b>5.9</b></td><td class="mono">1.14×</td></tr>
+        <tr><td class="mono">residual-2</td><td class="mono">7.4 (vfold)</td><td class="mono"><b>6.7</b></td><td class="mono">1.11×</td></tr>
+        <tr><td class="mono">residual-4</td><td class="mono">7.4 (vfold)</td><td class="mono"><b>6.9</b></td><td class="mono">1.08×</td></tr>
+      </table>
+    </div>
+    <p>Only <b>binary</b> gets the clean 2×: it doubles the vector width <em>and</em> stays
+    integer, so the 4-doc-token transpose keeps the running max in a register
+    (<code>pmaxsd</code>, no float detour). The residual family can't — its per-token centroid
+    term forces the <b>float</b> fold from chapter 07 — and its <code>pshufb</code> table
+    (chapter 06) is bound to 128-bit lanes, so <b>residual-4/2 stay 256-bit</b>: VNNI only fuses
+    their three-op dot into one, ~1.1×, no width gained. Residual-1 goes full-512 but the
+    per-row horizontal reduce (the same cost the ARM <b>transpose-reduce</b> chased) plus the
+    float fold cap it at 1.14×. Width helps exactly where the fold can stay in integers.</p>
+    <p><b>How do you even test this?</b> GitHub's shared x86 runners are a coin flip — an Intel
+    draw has VNNI, an AMD draw doesn't — so a green run <em>doesn't prove the kernel ran</em>:
+    the <code>if let Some(v) = maxsim_avx512(…)</code> parity check passes doing nothing on AMD
+    (the Rosetta trap from class 03, in an x86 hat). The fix is a CI job that runs the suite
+    under <b>Intel SDE</b> emulating an Ice Lake core, so feature detection reports VNNI and the
+    kernels execute <em>every run</em> — with a guard test that fails loudly if the emulator
+    somehow didn't. Correctness from the emulator; the µs/doc above from the runs that draw
+    Intel.</p>
+  </div>
 </section>
 
 <!-- ═══ 09 THE FLAT LINE ═══ -->
