@@ -208,6 +208,57 @@ def score_binary(q8, packed_bits, dim):
 
 
 # ----------------------------------------------------------------------------
+# 3.5 Fused residual scoring (the LUT identity)
+#
+# The binary identity generalizes. A residual token decodes to
+# centroid[cid] + weights[codes], so its dot with a query row splits:
+#
+#     q . token = q . centroid[cid]  +  sum_d q_d * weights[code_d]
+#
+# The first term is a lookup: q @ centroids.T is ALREADY computed for stage 1
+# (one small matmul, [nq, K]). The second term never needs the float token:
+# quantize the query to int8 (as for binary) and the 2^nbits `weights` to int8
+# (one shared table for every dim -- that's what makes this work), and it's an
+# integer dot between the query row and table-looked-up bytes. 2P - T is
+# exactly this with nbits=1 and weights {-1,+1}. kernels/ implements the
+# lookup with one in-register instruction (NEON tbl / AVX2 pshufb); here numpy
+# materializes the int8 bytes and lets BLAS do the same exact integers.
+
+
+@dataclass
+class LutI8:
+    values: np.ndarray   # [2^nbits] int8
+    scale: np.float32    # values * scale ~= codec.weights
+
+
+def quantize_lut(codec):
+    scale = np.float32(max(np.abs(codec.weights).max() / 127.0, 1e-12))
+    values = np.clip(np.rint(codec.weights / scale), -127, 127).astype(np.int8)
+    return LutI8(values, scale)
+
+
+def unpack_codes(packed, dim, nbits):
+    """[n, dim*nbits/8] packed uint8 -> [n, dim] bucket indices."""
+    bits = np.unpackbits(packed, axis=1, count=dim * nbits)
+    return (bits.reshape(len(packed), dim, nbits)
+            @ (1 << np.arange(nbits - 1, -1, -1))).astype(np.uint8)
+
+
+def score_residual_lut(q8, lut, packed, cids, cdot, dim, nbits):
+    """The fused identity for every (query token, doc token) -> [nq, n] f32.
+
+    cdot is the stage-1 [nq, K] centroid-similarity matrix. This function is
+    the SPEC for the fused kernels in kernels/: same integers, and the same
+    float32 operation order (scale-product, times acc, plus centroid term),
+    so the Rust rungs must match it bit for bit.
+    """
+    w = lut.values[unpack_codes(packed, dim, nbits)]              # [n, dim] i8
+    acc = (q8.values.astype(np.float32) @ w.T.astype(np.float32))  # exact ints:
+    # |sum| <= 128 * 127 * 127 ~ 2.1e6 < 2^24, so BLAS f32 == integer math
+    return (q8.scales * lut.scale)[:, None] * acc + cdot[:, cids]
+
+
+# ----------------------------------------------------------------------------
 # 4. The index
 #
 # centroids    [K, dim]        the codebook
@@ -342,12 +393,15 @@ class _StageClock:
         self.t = now
 
 
-def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None, timings=None):
+def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None,
+           residual_scorer=None, timings=None):
     """Two-stage search. `binary_scorer`, if given, replaces the numpy binary
     stage-2: it takes (query [nq, dim], candidates' packed rows, per-doc token
     counts) and returns one score per candidate doc -- the hook eval.py uses to
-    drop in the Rust kernel. Ignored for the residual scheme. `timings`, if a
-    dict, collects per-stage seconds (profiling only).
+    drop in the Rust kernel. `residual_scorer` is the same hook for the fused
+    residual kernel: (query, packed rows, centroid ids, cdot [nq, K], counts)
+    -> per-doc scores. `timings`, if a dict, collects per-stage seconds
+    (profiling only).
     """
     clock = _StageClock(timings)
     q = np.ascontiguousarray(q, dtype=np.float32)
@@ -387,6 +441,9 @@ def search(index, q, k=10, n_probe=8, n_full=1024, binary_scorer=None, timings=N
     # shares the same max-reduce-and-sum tail.
     if index.scheme == "binary" and binary_scorer is not None:
         scores = binary_scorer(q, index.payload[rows], index.doc_lens[cand])
+    elif index.scheme == "residual" and residual_scorer is not None:
+        scores = residual_scorer(q, index.payload[rows], index.codes[rows],
+                                 cs, index.doc_lens[cand])
     else:
         if index.scheme == "residual":
             sim = q @ decode_rows(index, rows).T
@@ -439,4 +496,27 @@ if __name__ == "__main__":
             p = int(q8.values[i][bits[j] == 1].sum())
             slow = (2 * p - int(q8.sums[i])) * q8.scales[i]
             assert abs(slow - fast[i, j]) < 1e-3
+
+    # The fused-residual LUT identity, same treatment: (a) the integer path
+    # matches a literal per-element loop exactly, (b) it stays close to the
+    # float decode path (its only extra error is int8-ing q and the 16 weights).
+    ridx = build(corpus, doc_lens, scheme="residual", nbits=4,
+                 n_centroids=256, verbose=False)
+    lut = quantize_lut(ridx.codec)
+    cdot = q @ ridx.centroids.T
+    rows = np.arange(50)
+    fast = score_residual_lut(q8, lut, ridx.payload[rows], ridx.codes[rows],
+                              cdot, dim, 4)
+    codes_u = unpack_codes(ridx.payload[rows], dim, 4)
+    for i in range(len(q8.values)):
+        for j in range(0, 50, 7):
+            acc = int((q8.values[i].astype(np.int32)
+                       * lut.values[codes_u[j]].astype(np.int32)).sum())
+            slow = (np.float32(q8.scales[i] * lut.scale) * np.float32(acc)
+                    + cdot[i, ridx.codes[j]])
+            assert slow == fast[i, j], "LUT integer spec drifted"
+    exact_sim = q @ decode_rows(ridx, rows).T
+    err = np.abs(fast - exact_sim).max()
+    assert err < 0.01, f"LUT path strayed from float decode: {err}"
+    print(f"residual LUT identity ok (max |lut - float decode| = {err:.4f})")
     print("2P - T identity matches the per-bit loop. All good.")

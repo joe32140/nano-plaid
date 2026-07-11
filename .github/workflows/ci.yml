@@ -6,14 +6,18 @@ on:
   pull_request:
 
 jobs:
-  # Rust runs on both arches so both fused kernels are actually executed:
-  # ubuntu-latest is x86_64 with AVX2 (verifies maxsim_avx2_sad128), macos-latest
-  # is arm64 with dotprod (verifies maxsim_neon128). The all_rungs_agree test
-  # asserts each available kernel is bit-identical to the scalar reference.
+  # Rust runs on three platforms so every fused kernel is actually executed:
+  # ubuntu-latest is x86_64 with AVX2 (the masked-SAD binary kernel and the
+  # pshufb residual kernel), macos-latest is Apple arm64 with dotprod (the
+  # SDOT binary kernel and the tbl residual kernel), ubuntu-24.04-arm is a
+  # Neoverse arm64 — same NEON kernels on a different microarchitecture,
+  # exactly where SDOT-vs-SMMLA issue rates can flip (see kernels/README).
+  # The *_rungs_agree tests assert each available kernel is bit-identical to
+  # the scalar reference.
   rust:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -42,3 +46,23 @@ jobs:
       - run: pip install numpy
       - run: python nanoplaid.py
       - run: python eval.py data/toy --n-full 64
+
+  # The pyo3 bridge, end-to-end on all three platforms: build the wheel,
+  # assert the extension reproduces the numpy specs (this executes AVX2 on
+  # ubuntu-latest and NEON on both arm runners), then run the committed toy
+  # bundle through `--backend rust` so the fused residual + binary paths are
+  # exercised inside the real two-stage search.
+  bridge:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy .
+      - run: python kernels/test_bridge.py
+      - run: python eval.py data/toy --schemes residual4,binary --backend rust --n-full 64

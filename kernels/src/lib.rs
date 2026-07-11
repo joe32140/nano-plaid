@@ -48,6 +48,17 @@ pub struct QueryI8 {
     /// layout the AVX2 masked-SAD kernel consumes, where the sum of selected
     /// biased bytes is `P + 128·popcount(bits)`.
     pub biased: Vec<u8>,
+    /// Even/odd-permuted codes for the fused residual kernels (`dim == 128`
+    /// only). A 4-bit codes byte holds dims `2k` (high nibble) and `2k+1`
+    /// (low nibble), so an in-register nibble split yields the EVEN dims'
+    /// table lookups, then the ODD dims'. Per 64-dim group `g`:
+    /// `perm4[qi*128 + g*64 + k]      = values[qi*128 + g*64 + 2k]` (evens)
+    /// `perm4[qi*128 + g*64 + 32 + k] = values[qi*128 + g*64 + 2k+1]` (odds)
+    /// — the order the looked-up weight bytes come out in.
+    pub perm4: Vec<i8>,
+    /// `|perm4|` as u8 — the unsigned operand for AVX2's `pmaddubsw` int8 dot
+    /// (`perm4` itself supplies the signs through `psignb`).
+    pub absq4: Vec<u8>,
 }
 
 pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
@@ -109,6 +120,22 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
     };
     // Biased u8 codes for the AVX2 masked-SAD kernel (row-major, all dims).
     let biased = values.iter().map(|&x| (x as u8) ^ 0x80).collect();
+    // Even/odd permutation for the fused residual kernels (see field doc).
+    let perm4 = if dim == 128 {
+        let mut p = vec![0i8; nq * 128];
+        for qi in 0..nq {
+            for g in 0..2 {
+                for k in 0..32 {
+                    p[qi * 128 + g * 64 + k] = values[qi * 128 + g * 64 + 2 * k];
+                    p[qi * 128 + g * 64 + 32 + k] = values[qi * 128 + g * 64 + 2 * k + 1];
+                }
+            }
+        }
+        p
+    } else {
+        Vec::new()
+    };
+    let absq4 = perm4.iter().map(|&x| x.unsigned_abs()).collect();
     QueryI8 {
         dim,
         values,
@@ -117,7 +144,78 @@ pub fn quantize_query_i8(q: &[f32], dim: usize) -> QueryI8 {
         planes,
         planes_smmla,
         biased,
+        perm4,
+        absq4,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused residual scoring (nbits = 4): the LUT identity.
+//
+// A residual token decodes to `centroid[cid] + weights[codes]`, so
+//
+//     q · token = q · centroid[cid]  +  Σ_d q_d · weights[code_d]
+//
+// The centroid term is already sitting in stage 1's [nq, K] matrix — a table
+// lookup. The residual term never needs the float token: `weights` is ONE
+// 16-entry table shared by every dim, so int8-quantize it (numpy's
+// `quantize_lut`) and the term becomes an integer dot between the query row
+// and table-looked-up bytes. The binary identity is the 1-bit special case
+// (weights = {−1,+1} gives 2P − T). One in-register instruction does 16
+// lookups at once: NEON `tbl` / AVX2 `pshufb` — the same instruction FAISS's
+// 4-bit fast-scan and llama.cpp's Q4 kernels are built on.
+//
+// Unlike the binary kernels, the max must happen in FLOAT: the centroid term
+// varies per token, so per-(query row, token) the score is
+// `fl(fl(scaleq·scalew) · acc) + cdot` — every rung computes those f32 ops in
+// this exact order, which is also `nanoplaid.score_residual_lut`'s order, so
+// all rungs stay bit-identical.
+
+/// The int8-quantized 16-entry decode table (`values · scale ≈ weights`).
+/// Invariant: every entry is in `[-127, 127]` (numpy's `quantize_lut` clips)
+/// so AVX2's sign-flip trick can never hit `-128`.
+pub struct LutI8 {
+    pub values: [i8; 16],
+    pub scale: f32,
+}
+
+/// Scalar reference for fused residual-4 MaxSim over one doc.
+///
+/// `codes`: `nd * dim/2` bytes of packed 4-bit bucket indices (np.packbits
+/// order: high nibble = even dim). `cids[d]`: the token's centroid id.
+/// `cdot_t`: the stage-1 centroid matrix TRANSPOSED, `[K, nq]` — one
+/// contiguous nq-row per centroid, so a token's lookups are one cache line.
+pub fn maxsim_r4_scalar(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> f32 {
+    let dim = q.dim;
+    let pd = dim / 2;
+    let nq = q.scales.len();
+    debug_assert_eq!(codes.len(), cids.len() * pd);
+    let mut total = 0.0f32;
+    for qi in 0..nq {
+        let sqw = q.scales[qi] * lut.scale;
+        let qrow = &q.values[qi * dim..(qi + 1) * dim];
+        let mut best = f32::NEG_INFINITY;
+        for (d, &cid) in cids.iter().enumerate() {
+            let tok = &codes[d * pd..(d + 1) * pd];
+            let mut acc = 0i32;
+            for (j, &b) in tok.iter().enumerate() {
+                acc += qrow[2 * j] as i32 * lut.values[(b >> 4) as usize] as i32;
+                acc += qrow[2 * j + 1] as i32 * lut.values[(b & 15) as usize] as i32;
+            }
+            let s = sqw * acc as f32 + cdot_t[cid as usize * nq + qi];
+            if s > best {
+                best = s;
+            }
+        }
+        total += best;
+    }
+    total
 }
 
 /// Pack each row's sign bits MSB-first: 32× smaller than f32.
@@ -347,6 +445,73 @@ mod neon {
             total += vmaxvq_s32(vld1q_s32(best.as_ptr().add(qi * 4))) as f32 * scale;
         }
         total
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused residual-4: same doc-token-outer shape as the binary kernel, with
+    // `tbl` replacing the bit-plane expansion. Per doc token: split the 64
+    // packed bytes into high/low nibbles (even/odd dims) and run each through
+    // the 16-entry int8 weight table — one `tbl` instruction does 16 lookups.
+    // The 128 looked-up weight bytes live in 8 registers, amortized over every
+    // query row exactly like the binary expansion; the inner loop is the same
+    // 8 SDOTs. The float tail differs: the centroid term varies per token, so
+    // each (query row, token) folds to a scalar and maxes in f32 (matching
+    // `maxsim_r4_scalar`'s operation order bit-for-bit).
+
+    /// # Safety
+    /// Requires `dotprod`; `q.perm4` must be populated (dim == 128);
+    /// `codes.len() == cids.len() * 64`; every cid indexes a `cdot_t` row.
+    pub unsafe fn maxsim_r4_neon128(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt = vld1q_s8(lut.values.as_ptr());
+        let low4 = vdupq_n_u8(0x0F);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = vld1q_u8(cp);
+            let v1 = vld1q_u8(cp.add(16));
+            let v2 = vld1q_u8(cp.add(32));
+            let v3 = vld1q_u8(cp.add(48));
+            // 8 weight vectors in perm4 order: per 64-dim group, evens (high
+            // nibbles) then odds (low nibbles).
+            let w = [
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v0)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v1)),
+                vqtbl1q_s8(wt, vandq_u8(v0, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v1, low4)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v2)),
+                vqtbl1q_s8(wt, vshrq_n_u8::<4>(v3)),
+                vqtbl1q_s8(wt, vandq_u8(v2, low4)),
+                vqtbl1q_s8(wt, vandq_u8(v3, low4)),
+            ];
+            let crow = cdot_t.as_ptr().add(cid as usize * nq);
+            for (qi, best_qi) in best.iter_mut().enumerate() {
+                let qp = q.perm4.as_ptr().add(qi * 128);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                a = sdot(a, vld1q_s8(qp), w[0]);
+                b = sdot(b, vld1q_s8(qp.add(16)), w[1]);
+                a = sdot(a, vld1q_s8(qp.add(32)), w[2]);
+                b = sdot(b, vld1q_s8(qp.add(48)), w[3]);
+                a = sdot(a, vld1q_s8(qp.add(64)), w[4]);
+                b = sdot(b, vld1q_s8(qp.add(80)), w[5]);
+                a = sdot(a, vld1q_s8(qp.add(96)), w[6]);
+                b = sdot(b, vld1q_s8(qp.add(112)), w[7]);
+                let acc = vaddvq_s32(vaddq_s32(a, b));
+                let s = sqw[qi] * acc as f32 + *crow.add(qi);
+                if s > *best_qi {
+                    *best_qi = s;
+                }
+            }
+        }
+        best.iter().sum()
     }
 
     // -----------------------------------------------------------------------
@@ -581,6 +746,73 @@ mod x86 {
         }
         total
     }
+
+    // -----------------------------------------------------------------------
+    // Fused residual-4 on AVX2: `pshufb` is the 16-entry table lookup (the
+    // same instruction FAISS's 4-bit fast-scan is built on), and the int8 dot
+    // uses the classic sign-transfer pair: `psignb` moves the query's signs
+    // onto the looked-up weights, `pmaddubsw` multiplies |q| (unsigned) by
+    // them. With both operands ≤ 127 in magnitude a pair sum is ≤ 32258, so
+    // the i16 lanes cannot saturate — that's why LutI8 clips to [-127, 127].
+
+    /// # Safety
+    /// Requires `avx2`; `q.perm4`/`q.absq4` must be populated (dim == 128);
+    /// `codes.len() == cids.len() * 64`; every cid indexes a `cdot_t` row.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn maxsim_r4_avx2_128(
+        q: &super::QueryI8,
+        lut: &super::LutI8,
+        codes: &[u8],
+        cids: &[u32],
+        cdot_t: &[f32],
+    ) -> f32 {
+        let nq = q.scales.len();
+        let wt =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.values.as_ptr() as *const __m128i));
+        let low4 = _mm256_set1_epi8(0x0F);
+        let ones = _mm256_set1_epi16(1);
+        let sqw: Vec<f32> = q.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        for (d, &cid) in cids.iter().enumerate() {
+            let cp = codes.as_ptr().add(d * 64);
+            let v0 = _mm256_loadu_si256(cp as *const __m256i);
+            let v1 = _mm256_loadu_si256(cp.add(32) as *const __m256i);
+            // 4 weight vectors in perm4 order: per 64-dim group, evens (high
+            // nibbles) then odds (low nibbles). pshufb reads only the low 4
+            // index bits when bit 7 is clear, and both extractions mask to 15.
+            let w = [
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v0, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v0, low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(_mm256_srli_epi16(v1, 4), low4)),
+                _mm256_shuffle_epi8(wt, _mm256_and_si256(v1, low4)),
+            ];
+            let crow = cdot_t.as_ptr().add(cid as usize * nq);
+            for (qi, best_qi) in best.iter_mut().enumerate() {
+                let qs = q.perm4.as_ptr().add(qi * 128);
+                let qa = q.absq4.as_ptr().add(qi * 128);
+                let mut acc = _mm256_setzero_si256();
+                for (g, &wg) in w.iter().enumerate() {
+                    let sign_src = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                    let mag = _mm256_loadu_si256(qa.add(g * 32) as *const __m256i);
+                    let ws = _mm256_sign_epi8(wg, sign_src); // w·sign(q), 0 where q=0
+                    let p16 = _mm256_maddubs_epi16(mag, ws); // |q|·ws, adjacent pairs
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
+                }
+                let x = _mm_add_epi32(
+                    _mm256_castsi256_si128(acc),
+                    _mm256_extracti128_si256(acc, 1),
+                );
+                let x = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+                let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0b01));
+                let acc = _mm_cvtsi128_si32(x);
+                let s = sqw[qi] * acc as f32 + *crow.add(qi);
+                if s > *best_qi {
+                    *best_qi = s;
+                }
+            }
+        }
+        best.iter().sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +864,36 @@ pub fn maxsim_avx2(q: &QueryI8, bits: &[u8], dim: usize) -> Option<f32> {
     #[cfg(target_arch = "x86_64")]
     if dim == 128 && !q.biased.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
         return Some(unsafe { x86::maxsim_avx2_sad128(q, bits) });
+    }
+    None
+}
+
+/// Fused residual-4 MaxSim over one doc: dispatched (NEON tbl+sdot / AVX2
+/// pshufb+psignb where available, scalar reference otherwise).
+pub fn maxsim_r4(q: &QueryI8, lut: &LutI8, codes: &[u8], cids: &[u32], cdot_t: &[f32]) -> f32 {
+    if let Some(v) = maxsim_r4_fused(q, lut, codes, cids, cdot_t) {
+        return v;
+    }
+    maxsim_r4_scalar(q, lut, codes, cids, cdot_t)
+}
+
+/// The fused residual kernel this CPU supports, if `dim == 128`, else `None`.
+/// Exposed so the bench and tests can time/verify it explicitly.
+#[allow(unused_variables)]
+pub fn maxsim_r4_fused(
+    q: &QueryI8,
+    lut: &LutI8,
+    codes: &[u8],
+    cids: &[u32],
+    cdot_t: &[f32],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(unsafe { neon::maxsim_r4_neon128(q, lut, codes, cids, cdot_t) });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if q.dim == 128 && !q.perm4.is_empty() && std::arch::is_x86_feature_detected!("avx2") {
+        return Some(unsafe { x86::maxsim_r4_avx2_128(q, lut, codes, cids, cdot_t) });
     }
     None
 }
@@ -689,6 +951,92 @@ mod tests {
                 assert_eq!(a, v, "avx2 ({nq},{nd},{dim})");
             }
         }
+    }
+
+    fn setup_r4(
+        nq: usize,
+        nd: usize,
+        dim: usize,
+        n_cent: usize,
+        seed: u64,
+    ) -> (QueryI8, LutI8, Vec<u8>, Vec<u32>, Vec<f32>) {
+        let mut s = seed;
+        let q: Vec<f32> = (0..nq * dim).map(|_| randf(&mut s)).collect();
+        let mut values = [0i8; 16];
+        for v in values.iter_mut() {
+            *v = (randf(&mut s) * 254.0) as i8; // in [-127, 127]: the invariant
+        }
+        let lut = LutI8 {
+            values,
+            scale: 0.0031,
+        };
+        let codes: Vec<u8> = (0..nd * dim / 2)
+            .map(|_| ((randf(&mut s) + 0.5) * 255.99) as u8)
+            .collect();
+        let cids: Vec<u32> = (0..nd)
+            .map(|_| ((randf(&mut s) + 0.5) * (n_cent as f32 - 0.01)) as u32)
+            .collect();
+        let cdot_t: Vec<f32> = (0..n_cent * nq).map(|_| randf(&mut s) * 4.0).collect();
+        (quantize_query_i8(&q, dim), lut, codes, cids, cdot_t)
+    }
+
+    #[test]
+    fn residual_rungs_agree_exactly() {
+        // Scalar reference, dispatcher, and whichever fused kernel this CPU
+        // has must return bit-identical floats — the f32 op order per
+        // (query row, token) is part of the spec.
+        for &(nq, nd) in &[(32, 80), (7, 3), (1, 1)] {
+            let (q, lut, codes, cids, cdot_t) = setup_r4(nq, nd, 128, 16, 99 + nd as u64);
+            let a = maxsim_r4_scalar(&q, &lut, &codes, &cids, &cdot_t);
+            assert_eq!(
+                a,
+                maxsim_r4(&q, &lut, &codes, &cids, &cdot_t),
+                "dispatched ({nq},{nd})"
+            );
+            if let Some(v) = maxsim_r4_fused(&q, &lut, &codes, &cids, &cdot_t) {
+                assert_eq!(a, v, "fused ({nq},{nd})");
+            }
+        }
+        // Non-128 dims must fall back to the scalar rung, not crash.
+        let (q, lut, codes, cids, cdot_t) = setup_r4(3, 5, 64, 8, 7);
+        assert!(maxsim_r4_fused(&q, &lut, &codes, &cids, &cdot_t).is_none());
+        assert_eq!(
+            maxsim_r4(&q, &lut, &codes, &cids, &cdot_t),
+            maxsim_r4_scalar(&q, &lut, &codes, &cids, &cdot_t)
+        );
+    }
+
+    #[test]
+    fn residual_identity_matches_float_reference() {
+        // Dequantize everything (query rows, LUT weights) and recompute the
+        // fused score with a transparent float loop; only f32 association
+        // error may separate them.
+        let (nq, nd, dim, k) = (8, 20, 128, 16);
+        let (q8, lut, codes, cids, cdot_t) = setup_r4(nq, nd, dim, k, 5);
+        let fast = maxsim_r4(&q8, &lut, &codes, &cids, &cdot_t);
+        let mut reference = 0.0f64;
+        for qi in 0..nq {
+            let mut best = f64::NEG_INFINITY;
+            for (d, &cid) in cids.iter().enumerate() {
+                let mut dot = 0.0f64;
+                for j in 0..dim / 2 {
+                    let b = codes[d * dim / 2 + j];
+                    let qe = q8.values[qi * dim + 2 * j] as f64 * q8.scales[qi] as f64;
+                    let qo = q8.values[qi * dim + 2 * j + 1] as f64 * q8.scales[qi] as f64;
+                    dot += qe * (lut.values[(b >> 4) as usize] as f64 * lut.scale as f64);
+                    dot += qo * (lut.values[(b & 15) as usize] as f64 * lut.scale as f64);
+                }
+                let s = dot + cdot_t[cid as usize * nq + qi] as f64;
+                if s > best {
+                    best = s;
+                }
+            }
+            reference += best;
+        }
+        assert!(
+            (reference as f32 - fast).abs() < 1e-2,
+            "{reference} vs {fast}"
+        );
     }
 
     #[test]

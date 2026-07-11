@@ -118,4 +118,64 @@ fn main() {
             a.as_secs_f64() / b.as_secs_f64()
         );
     }
+
+    // ── fused residual-4: the LUT identity ────────────────────────────────
+    // Same doc set, now as 4-bit residual codes + a centroid id per token.
+    // The float baseline for this scheme is decompress + BLAS GEMM, which
+    // this bench can't reproduce dependency-free; rung 1's f32 loop stands in
+    // as the common yardstick, so compare the residual rungs to each other
+    // and to the binary fused kernel above.
+    let mut s2 = 7u64;
+    const K: usize = 4096;
+    let r4_codes: Vec<Vec<u8>> = (0..N_DOCS)
+        .map(|_| {
+            (0..DOC_TOKENS * DIM / 2)
+                .map(|_| ((randf(&mut s2) + 0.5) * 255.99) as u8)
+                .collect()
+        })
+        .collect();
+    let r4_cids: Vec<Vec<u32>> = (0..N_DOCS)
+        .map(|_| {
+            (0..DOC_TOKENS)
+                .map(|_| ((randf(&mut s2) + 0.5) * (K as f32 - 0.01)) as u32)
+                .collect()
+        })
+        .collect();
+    let cdot_t: Vec<f32> = (0..K * QUERY_TOKENS).map(|_| randf(&mut s2)).collect();
+    let mut lut_vals = [0i8; 16];
+    for v in lut_vals.iter_mut() {
+        *v = (randf(&mut s2) * 254.0) as i8;
+    }
+    let lut = LutI8 {
+        values: lut_vals,
+        scale: 0.0031,
+    };
+
+    let tr_scalar = best_of(|| {
+        r4_codes
+            .iter()
+            .zip(&r4_cids)
+            .map(|(c, ids)| maxsim_r4_scalar(&q, &lut, c, ids, &cdot_t))
+            .sum()
+    });
+    let tr_fused = maxsim_r4_fused(&q, &lut, &r4_codes[0], &r4_cids[0], &cdot_t).map(|_| {
+        best_of(|| {
+            r4_codes
+                .iter()
+                .zip(&r4_cids)
+                .map(|(c, ids)| maxsim_r4_fused(&q, &lut, c, ids, &cdot_t).unwrap())
+                .sum()
+        })
+    });
+
+    println!("\nfused residual-4 (LUT identity; same shape, 4-bit codes + centroid ids):");
+    line("r4      scalar reference", tr_scalar);
+    if let Some(t) = tr_fused {
+        #[cfg(target_arch = "aarch64")]
+        line("r4      fused NEON tbl  ", t);
+        #[cfg(target_arch = "x86_64")]
+        line("r4      fused AVX2 shufb", t);
+    } else {
+        println!("  (no fused residual kernel for this CPU)");
+    }
 }

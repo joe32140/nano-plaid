@@ -52,6 +52,44 @@ Quantize the query row to int8 (`q ≈ scale · v`). Doc values are signs
 bit-masked sum of int8s — no decompression. `P` via SDOT is `v · bits` with
 `bits ∈ {0,1}`, which is why rung 4 expands bits to 0/1 bytes, not ±1.
 
+## the second ladder: fused residual-4
+
+The repo's original claim was that only the 1-bit scheme deserved a custom
+kernel — residual-4's rescore is `decode → BLAS matmul`, and you don't beat
+BLAS at float GEMM. True, and beside the point: you beat it by never
+materializing the floats it needs. The identity generalizes. A residual token
+decodes to `centroid[cid] + weights[codes]`, so
+
+    q · token = q · centroid[cid]  +  Σ_d v_d · weights[code_d]
+
+The centroid term is a lookup into the `[nq, K]` matrix stage 1 already
+computed. And because `weights` is ONE 16-entry table shared by every dim,
+int8-quantize it once (`nanoplaid.quantize_lut`) and the residual term is an
+integer dot between the query row and *table-looked-up* bytes — `2P − T` is
+exactly this with nbits=1 and weights `{−1,+1}`. One instruction does 16
+lookups in-register: NEON `tbl` / AVX2 `pshufb`, the same instrument FAISS's
+4-bit fast-scan and llama.cpp's Q4 kernels are built on. Everything else is
+rung 4's fusion, reused: split nibbles → look up 128 weight bytes once per doc
+token → SDOT (or `psignb`+`pmaddubsw` on AVX2) against every query row.
+
+| kernel | idea | µs/doc (M4) | vs f32 loop |
+|--------|------|------------:|------------:|
+| `maxsim_r4_scalar` | the LUT identity, one lookup per value | 92.5 | 0.78× |
+| `maxsim_r4_neon128` | fused `tbl` + SDOT | 4.52 | 16.1× |
+
+(Same benchmark shape as the ladder table; `maxsim_r4_avx2_128` is the x86
+rung, verified bit-identical on CI.) Two familiar lessons, replayed: the
+scalar rung is again *slower* than the float loop — the identity is never the
+speedup — and the fused rung costs ~2.4× the binary kernel (4× the payload
+bytes, plus a float max: the centroid term varies per token, so each score
+folds to f32 before comparing instead of staying integer to the end).
+
+End to end this retires the "rust is binary-only" asterisk: on full SciFact
+the residual-4 rescore drops from 114 ms (numpy decode+GEMM) to **8.4 ms —
+13.6×** — the best-quality scheme at binary-path speed, for a measured
+−0.0005 NDCG quantization cost (the LUT adds int8 error only to the
+*residual*; the centroid term stays float).
+
 ## how to not fool yourself (field notes)
 
 All three of these happened while writing these kernels' production twin:
@@ -81,9 +119,13 @@ python ../eval.py ../data/scifact --backend rust
 
 `maxsim_docs(query, payload, lens)` scores a query's candidate documents and
 returns one MaxSim per doc — the exact numbers `nanoplaid.score_binary`
-produces, computed through this crate's dispatched kernel. On an Apple Silicon
-Mac, build with `--target aarch64-apple-darwin` so the extension is native and
-the SDOT rung actually runs (see the Rosetta note above).
+produces, computed through this crate's dispatched kernel.
+`maxsim_docs_r4(query, codes, cids, cdot_t, lens, lut_values, lut_scale)` is
+the fused residual-4 twin, matching `nanoplaid.score_residual_lut`;
+`kernels/test_bridge.py` asserts both parities and runs on every CI platform.
+On an Apple Silicon Mac, build with `--target aarch64-apple-darwin` so the
+extension is native and the SDOT rung actually runs (see the Rosetta note
+above).
 
 ## exercises
 
@@ -101,3 +143,8 @@ Each has a production answer in
 4. **Store the expansion?** Precompute each doc token's 128 expanded bytes at
    index time and skip `extract_planes_128`. Measure why this *loses* (hint:
    16 B vs 128 B of memory traffic per token).
+5. **residual-2.** The fused residual ladder covers nbits=4 only; 2-bit codes
+   are a 4-entry table and a different unpack (4 codes per byte). Extend
+   `maxsim_r4_neon128` — the `tbl` gets *cheaper* — and measure whether
+   residual-2 can hold its 84 ms numpy latency advantage over residual-4 once
+   both are fused.

@@ -94,9 +94,14 @@ def eval_bundle(b, schemes, args, scorer, verbose=False, profile=False):
         build_s = time.perf_counter() - t
         centroids = idx.centroids
         s = scorer if name == "binary" else None
+        rs = None
+        if args.backend == "rust" and name == "residual" and nbits == 4:
+            rs = make_rust_residual_scorer(idx)
         stages = {} if profile else None
         n, lat = run(b, lambda q: npl.search(idx, q, args.k, args.n_probe,
-                                             args.n_full, s, stages)[0], args.k)
+                                             args.n_full, binary_scorer=s,
+                                             residual_scorer=rs,
+                                             timings=stages)[0], args.k)
         out[scheme] = dict(ndcg=n, lat=lat, bpt=idx.bytes_per_token(),
                            build_s=build_s, index_mb=idx.nbytes() / 1e6,
                            stages=stages or {})
@@ -229,6 +234,29 @@ def make_rust_scorer():
             np.ascontiguousarray(q, np.float32),
             np.ascontiguousarray(payload, np.uint8),
             np.ascontiguousarray(lens, np.int64))
+
+    return scorer
+
+
+def make_rust_residual_scorer(idx):
+    """Wrap the fused residual-4 kernel as a nanoplaid residual_scorer. The
+    int8 LUT comes from the index's codec (quantize_lut, the numpy spec the
+    kernel matches bit-for-bit); the stage-1 centroid matrix is transposed at
+    the boundary so each token's per-query-row lookups are contiguous."""
+    import nanoplaid_kernels
+
+    lut = npl.quantize_lut(idx.codec)
+    lut_values = np.ascontiguousarray(lut.values, np.int8)
+    lut_scale = float(lut.scale)
+
+    def scorer(q, packed, cids, cdot, lens):
+        return nanoplaid_kernels.maxsim_docs_r4(
+            np.ascontiguousarray(q, np.float32),
+            np.ascontiguousarray(packed, np.uint8),
+            np.ascontiguousarray(cids, np.uint32),
+            np.ascontiguousarray(cdot.T, np.float32),
+            np.ascontiguousarray(lens, np.int64),
+            lut_values, lut_scale)
 
     return scorer
 
