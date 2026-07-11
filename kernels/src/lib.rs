@@ -2770,6 +2770,34 @@ mod tests {
         }
     }
 
+    /// Guard against a SILENT SKIP: on x86 the `if let Some(v) = maxsim_avx512`
+    /// parity checks pass trivially when the CPU lacks VNNI (the accessor
+    /// returns `None`), so a green x86 run does NOT by itself prove the AVX-512
+    /// kernels were ever executed. When CI runs the suite under Intel SDE it
+    /// sets `NANOPLAID_REQUIRE_AVX512=1`; this test then DEMANDS the kernels be
+    /// live, turning "emulator didn't expose VNNI" from a false pass into a loud
+    /// failure. A no-op anywhere the env var is unset (native aarch64, plain x86).
+    #[test]
+    fn avx512_kernels_run_when_required() {
+        if std::env::var_os("NANOPLAID_REQUIRE_AVX512").is_none() {
+            return;
+        }
+        let (q, bits) = setup(8, 8, 128, 1);
+        assert!(
+            maxsim_avx512(&q, &bits, 128).is_some(),
+            "NANOPLAID_REQUIRE_AVX512 set but binary AVX-512 VNNI not detected"
+        );
+        for &(nbits, _, _, _, _) in &R_FAMILY {
+            let (q, lut, codes, cids, cdot_t) = setup_r(8, 8, 128, 16, nbits, 1);
+            let live = match nbits {
+                4 => maxsim_r4_avx512_fused(&q, &lut, &codes, &cids, &cdot_t),
+                2 => maxsim_r2_avx512_fused(&q, &lut, &codes, &cids, &cdot_t),
+                _ => maxsim_r1_avx512_fused(&q, &lut, &codes, &cids, &cdot_t),
+            };
+            assert!(live.is_some(), "residual-{nbits} AVX-512 VNNI not detected");
+        }
+    }
+
     /// Bucket index of dim `d` in one token's packed codes (np.packbits order,
     /// MSB-first within each byte) — the transparent decode the tests trust.
     fn code_at(tok: &[u8], d: usize, nbits: usize) -> usize {

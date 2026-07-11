@@ -66,3 +66,30 @@ jobs:
       - run: pip install numpy .
       - run: python kernels/test_bridge.py
       - run: python eval.py data/toy --schemes residual4,binary --backend rust --n-full 64
+
+  # AVX-512 VNNI is a per-run LOTTERY on GitHub's shared x86 runners: an Intel
+  # Ice Lake draw has it, an AMD EPYC draw does not. So the `rust` job above
+  # only executes the avx512 kernels when it happens to draw the right silicon —
+  # and when it doesn't, the `if let Some(v) = maxsim_avx512` parity checks pass
+  # trivially without running a thing. This job removes the luck: Intel SDE
+  # emulates an Ice Lake core (synthetic CPUID and all), so runtime feature
+  # detection reports VNNI and the fused kernels run DETERMINISTICALLY every
+  # time. `NANOPLAID_REQUIRE_AVX512=1` makes `avx512_kernels_run_when_required`
+  # fail loudly if the emulated CPU somehow didn't expose VNNI — no silent skip.
+  # Timing under emulation is meaningless, so this proves CORRECTNESS, not speed;
+  # the real µs/doc come from a natural Intel draw of the `rust` job.
+  avx512-emulated:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernels
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: petarpetrovt/setup-sde@v5.0
+      - name: test under SDE (Ice Lake — AVX-512 VNNI)
+        env:
+          NANOPLAID_REQUIRE_AVX512: "1"
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$SDE_PATH/sde64 -icx --"
+          cargo test --release
