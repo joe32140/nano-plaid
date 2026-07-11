@@ -249,7 +249,7 @@ fn main() {
     // Experimental r4 rung: the transpose-reduce fold (NEON only). Timed
     // against r4's vfold above — does eliminating the per-row horizontal
     // reduce actually help, or was it already hidden under the SDOTs?
-    if let Some(_) = maxsim_r4_tr_fused(&q, &lut, &r4_codes[0], &r4_cids[0], &cdot_t) {
+    if maxsim_r4_tr_fused(&q, &lut, &r4_codes[0], &r4_cids[0], &cdot_t).is_some() {
         let t = best_of(|| {
             r4_codes
                 .iter()
