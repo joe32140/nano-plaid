@@ -1,53 +1,83 @@
-# Baselines: compress+fused vs decompress+GEMM
+# Baselines: compress+fused vs decompress+GEMM (per residual route)
 
-`compare_mixedbread.py` pits this repo's compressed fused MaxSim kernels
-against [`mixedbread-ai/maxsim-cpu`](https://github.com/mixedbread-ai/maxsim-cpu),
-the two honest ends of the same line:
+`compare_mixedbread.py` answers one question for each residual route (nbits
+4/2/1): the codes are stored the same — so how you *score* them is the whole
+game. Three ways, head to head:
 
-- **mixedbread — decompress + GEMM.** Full `f32` document embeddings, a batched
-  BLAS `sgemm`, and a hand-vectorized max-fold. This is the upstream PyPI wheel
-  (`pip install maxsim-cpu`), their Rust + Accelerate/libxsmm code, called
-  unmodified — not a reimplementation. (It ships as a pyo3 `cdylib`, so it is
-  only reachable from Python; there is no Rust crate to link.)
-- **ours — compress + fused kernel.** The document is packed sign bits (binary,
-  16 B/token) or residual codes (32/64 B/token), scored with **no
-  decompression** through `nanoplaid_kernels`, the pyo3 bridge over the same
-  kernels the [kernel class](../docs/class4.html) dissects.
+1. **baseline GEMM** — decode codes → f32 tokens, then a plain per-doc BLAS
+   `sgemm` + max-fold (numpy). The naive path every system starts with.
+2. **mixedbread GEMM** — decode codes → f32 tokens, then
+   [`mixedbread-ai/maxsim-cpu`](https://github.com/mixedbread-ai/maxsim-cpu):
+   a batched `sgemm` + hand-vectorized fold. Their upstream PyPI wheel,
+   unmodified — the *optimized* GEMM. (It ships as a pyo3 `cdylib`, so it is
+   only reachable from Python; there is no Rust crate to link.)
+3. **ours (fused)** — score the codes directly through `nanoplaid_kernels`,
+   **no decode at all**. Our optimization.
 
-Both score every query against every document **exhaustively** (no ANN, no
-candidate cap), so the measured number is the scoring kernel and nothing else.
-We report the three axes that actually differ: per-doc latency, bytes/token,
-and NDCG@10 against the real qrels — mixedbread's exact `f32` score is the
-quality *ceiling*; ours pays compression error for 8–32× less memory.
+(1) and (2) score the identical f32 reconstruction, so their NDCG matches and
+only speed differs (that gap is the GEMM optimization). (3) scores an int8 view
+of the same codes, trading a hair of NDCG for never materializing f32: (1)/(2)
+must expand every token to **512 B** to score; (3) stays at the stored
+64/32/16 B. Scoring is exhaustive (no ANN), so the number is the kernel.
 
-## Result (SciFact, 300 queries × 5,183 docs, 1.19M doc tokens, dim=128)
+## Result (SciFact, 300 queries × 5,183 docs, 1.19M tokens, dim=128)
 
-Apple M-series, both engines **single-threaded** on Accelerate (`RAYON_NUM_THREADS=1`),
-so this isolates kernel efficiency — both are embarrassingly parallel across
-docs, so the single-core ratio is the apples-to-apples number.
+Apple M-series, **single-thread** on Accelerate (apples-to-apples per core;
+every method here parallelizes trivially across docs). `store` = stored
+bytes/token; `score` = bytes touched to score a token. Decode time is given to
+the GEMM rows **for free** (not timed) — they still lose.
 
-| engine | B/tok | vs f32 | µs/doc | vs GEMM | NDCG@10 | retention |
-|---|--:|--:|--:|--:|--:|--:|
-| mixedbread f32 GEMM | 512 | 1× | 15.30 | 1.00× | 0.7629 | 100% |
-| **ours: binary 1-bit fused** | 16 | **32×** | **3.77** | **4.06×** | 0.7513 | 98.5% |
-| ours: residual-4 fused | 64 | 8× | 4.22 | 3.62× | 0.7569 | 99.2% |
-| ours: residual-2 fused | 32 | 16× | 4.19 | 3.65× | 0.7372 | 96.6% |
+f32 ceiling (mixedbread on the *uncompressed* embeddings): **NDCG@10 = 0.7629**
 
-The pragmatic takeaway: against a well-optimized `f32` GEMM engine, scoring the
-compressed document directly is **3.6–4.1× faster at 8–32× less memory**, giving
-up 1–3 NDCG points. The GEMM has to touch 32× the bytes and materialize a score
-matrix; the fused kernel expands one doc token in registers and never leaves
-integer-land until the final scale. Memory is the point — at 16 B/token a corpus
-that needs 32 GB of `f32` fits in 1 GB.
+| route | method | store | score | µs/doc | vs base | NDCG@10 | retention |
+|---|---|--:|--:|--:|--:|--:|--:|
+| **r4** | baseline GEMM (per-doc) | 64 B | 512 B | 6.80 | 1.00× | 0.7599 | 99.6% |
+| | mixedbread GEMM | 64 B | 512 B | 14.66 | 0.46× | 0.7599 | 99.6% |
+| | **ours: fused on codes** | 64 B | **64 B** | **3.93** | **1.73×** | 0.7569 | 99.2% |
+| **r2** | baseline GEMM (per-doc) | 32 B | 512 B | 6.87 | 1.00× | 0.7356 | 96.4% |
+| | mixedbread GEMM | 32 B | 512 B | 15.12 | 0.45× | 0.7356 | 96.4% |
+| | **ours: fused on codes** | 32 B | **32 B** | **3.93** | **1.75×** | 0.7372 | 96.6% |
+| **r1** | baseline GEMM (per-doc) | 16 B | 512 B | 6.90 | 1.00× | 0.6138 | 80.5% |
+| | mixedbread GEMM | 16 B | 512 B | 15.26 | 0.45× | 0.6138 | 80.5% |
+| | **ours: fused on codes** | 16 B | **16 B** | **4.20** | **1.64×** | 0.6137 | 80.4% |
+
+Two things fall out:
+
+- **Our fused kernel beats the naive GEMM baseline 1.6–1.75× per route**, at
+  8–32× less scoring memory, needing no decode, at ~identical NDCG (our int8
+  ranking tracks the f32 reconstruction to within a rounding error — 0.7569 vs
+  0.7599 at r4). r1 is the quality floor (80% retention): the 1-bit residual
+  codec, not the kernel.
+- **mixedbread's GEMM optimization does not help here** — single-threaded on
+  variable-length docs it is *slower* than naive per-doc numpy, because its win
+  is multicore throughput on uniform batches, not per-core latency.
+
+### Giving mixedbread its best case (fairness)
+
+mixedbread is built for multicore uniform batches, so the single-thread
+variable-API row above is its worst case. Measured on the same corpus:
+
+| mixedbread config | µs/doc |
+|---|--:|
+| variable API, 1 thread (table above) | 15.0 |
+| variable API, 10 threads | 11.9 |
+| **uniform API (padded), 10 threads** — their fast path | **6.0** |
+
+Even at its genuine best — contiguous uniform layout, all 10 cores, their
+optimized `sgemm`+fold — mixedbread lands at 6.0 µs/doc, still **1.5× slower
+than our single-core 3.9**, and our kernel parallelizes across docs the same
+way. The compressed path wins because it never pays the decode-to-f32 or the
+32× memory traffic the GEMM is optimizing *around*.
 
 ## Run it
 
 ```bash
-# native arm64 bridge (avoid the Rosetta trap that would bench our fallback):
 CARGO_BUILD_TARGET=aarch64-apple-darwin pip install maxsim-cpu numpy .
-python bench/compare_mixedbread.py data/scifact              # full
-python bench/compare_mixedbread.py data/scifact --docs 400 --queries 40  # quick
+RAYON_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+  python bench/compare_mixedbread.py data/scifact
 ```
 
-On x86 drop the `CARGO_BUILD_TARGET`; the dispatcher picks AVX-512 VNNI / AVX2
-for our side and mixedbread uses libxsmm.
+`CARGO_BUILD_TARGET` keeps the bridge native arm64 — under Rosetta the NEON
+kernels compile out and our side would bench the autovec fallback (the trap the
+kernel class warns about). On x86 drop it; our side dispatches AVX-512 VNNI /
+AVX2 and mixedbread uses libxsmm.

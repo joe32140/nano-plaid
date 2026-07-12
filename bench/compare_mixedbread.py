@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Our compressed fused MaxSim vs mixedbread-ai/maxsim-cpu, on real SciFact.
+"""Compress+fused vs decompress+GEMM, per residual route, on real SciFact.
 
-Two sides of one line. mixedbread's `maxsim-cpu` is the *decompress + GEMM*
-engine: full f32 document embeddings, a batched BLAS sgemm, and a hand-
-vectorized max-fold (their Rust, their Accelerate/libxsmm build — the upstream
-PyPI wheel, called here unmodified). Ours is *compress + fused kernel*: the
-document is packed sign bits (binary) or residual codes, scored with no
-decompression through `nanoplaid_kernels` (the pyo3 bridge over the same
-kernels this repo's class dissects).
+The residual schemes (nbits 4/2/1) store the SAME compressed codes; the only
+thing that changes is HOW you score them. Three ways, head to head:
 
-The comparison is deliberately apples-to-apples on the WORK and honest about
-the TRADEOFF: both score every query against every document exhaustively (no
-ANN, no candidate cap), so the number is the scoring kernel and nothing else.
-We report the three axes that actually differ — per-doc latency, bytes/token,
-and NDCG@10 against the real qrels (mixedbread's exact f32 score is the quality
-ceiling; ours pays compression error for 8-32x less memory).
+  1. baseline GEMM  — decode codes -> f32 tokens, then a plain per-doc BLAS
+                      `sgemm` + max-fold (numpy). The naive path every system
+                      starts with.
+  2. mixedbread     — decode codes -> f32 tokens, then mixedbread-ai/maxsim-cpu:
+                      a batched `sgemm` + hand-vectorized fold (their upstream
+                      PyPI wheel, unmodified). The OPTIMIZED GEMM.
+  3. ours (fused)   — score the codes directly through `nanoplaid_kernels`, no
+                      decode at all. Our optimization.
 
-    pip install maxsim-cpu numpy .      # . builds nanoplaid_kernels (bridge)
-    python bench/compare_mixedbread.py [data/scifact] [--docs N] [--queries M]
+(1) and (2) score the identical f32 reconstruction, so their NDCG is the same
+and only their speed differs — that gap is the GEMM optimization. (3) scores an
+int8 view of the same codes, so it trades a little NDCG for never materializing
+the f32: (1)/(2) must expand every token to 512 B to score, (3) stays at the
+stored 64/32/16 B. Scoring is exhaustive (no ANN) so the number is the kernel.
 
-Note on Apple Silicon: build the bridge for arm64
-(`CARGO_BUILD_TARGET=aarch64-apple-darwin pip install .`) or the NEON kernels
-compile out under Rosetta and our side benches the autovec fallback — the same
-trap the kernel class warns about, and it would understate our kernels here.
+    CARGO_BUILD_TARGET=aarch64-apple-darwin pip install maxsim-cpu numpy .
+    python bench/compare_mixedbread.py [data/scifact] [--time-queries 30]
 """
 
 import argparse
@@ -46,144 +44,149 @@ def l2norm(x):
 
 
 def ndcg_at_k(ranked_ids, rel, k=10):
-    """NDCG@k for one query. `rel` maps doc_id -> graded relevance."""
     dcg = sum(rel.get(d, 0) / np.log2(i + 2) for i, d in enumerate(ranked_ids[:k]))
-    ideal = sorted(rel.values(), reverse=True)[:k]
-    idcg = sum(r / np.log2(i + 2) for i, r in enumerate(ideal))
+    idcg = sum(r / np.log2(i + 2) for i, r in enumerate(sorted(rel.values(), reverse=True)[:k]))
     return dcg / idcg if idcg > 0 else 0.0
 
 
-def best_of(fn, reps=3):
-    """Return (best wall time over `reps`, last result)."""
-    out = fn()  # warmup
-    best = float("inf")
-    for _ in range(reps):
-        t = time.perf_counter()
-        out = fn()
-        best = min(best, time.perf_counter() - t)
-    return best, out
+def best_of(fn, reps):
+    fn()  # warmup
+    return min((_timed(fn) for _ in range(reps)))
+
+
+def _timed(fn):
+    t = time.perf_counter()
+    fn()
+    return time.perf_counter() - t
+
+
+def naive_gemm(qf, recon_list):
+    """Baseline: one BLAS sgemm per doc, then max per query token, summed."""
+    out = np.empty(len(recon_list), np.float32)
+    for i, tok in enumerate(recon_list):
+        out[i] = (qf @ tok.T).max(axis=1).sum()
+    return out
+
+
+def mean_ndcg(score_all, n_qry, q_off, queries, qrels, query_ids, corpus_ids):
+    vals = []
+    for qi in range(n_qry):
+        rel = qrels.get(query_ids[qi], {})
+        if not rel:
+            continue
+        qf = np.ascontiguousarray(queries[q_off[qi] : q_off[qi + 1]])
+        scores = np.asarray(score_all(qf))
+        order = np.argsort(-scores)[:10]
+        vals.append(ndcg_at_k([corpus_ids[j] for j in order], rel, 10))
+    return float(np.mean(vals)) if vals else 0.0
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("data", nargs="?", default="data/scifact")
-    ap.add_argument("--docs", type=int, default=0, help="cap #docs (0 = all)")
-    ap.add_argument("--queries", type=int, default=0, help="cap #queries (0 = all)")
-    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--docs", type=int, default=0)
+    ap.add_argument("--queries", type=int, default=0, help="cap #queries for NDCG")
+    ap.add_argument("--time-queries", type=int, default=30, help="#queries for timing")
+    ap.add_argument("--reps", type=int, default=2)
     args = ap.parse_args()
 
     d = args.data
-    corpus = np.ascontiguousarray(np.load(f"{d}/corpus.npy"), dtype=np.float32)
+    corpus = l2norm(np.ascontiguousarray(np.load(f"{d}/corpus.npy"), dtype=np.float32))
     clens = np.load(f"{d}/corpus_lens.npy").astype(np.int64)
-    queries = np.ascontiguousarray(np.load(f"{d}/queries.npy"), dtype=np.float32)
+    queries = l2norm(np.ascontiguousarray(np.load(f"{d}/queries.npy"), dtype=np.float32))
     qlens = np.load(f"{d}/query_lens.npy").astype(np.int64)
     qrels = json.load(open(f"{d}/qrels.json"))
     corpus_ids = json.load(open(f"{d}/corpus_ids.json"))
     query_ids = json.load(open(f"{d}/query_ids.json"))
     dim = corpus.shape[1]
 
-    # Optional caps for a quick run.
     n_docs = len(clens) if args.docs <= 0 else min(args.docs, len(clens))
     n_qry = len(qlens) if args.queries <= 0 else min(args.queries, len(qlens))
-
-    # Normalize once; every engine sees identical vectors (mixedbread expects
-    # normalized input, and sign bits / int8 are scale-robust, so this is the
-    # consistent common ground rather than a thumb on the scale).
-    corpus = l2norm(corpus)
-    queries = l2norm(queries)
-
     doc_off = np.concatenate([[0], np.cumsum(clens)])
     q_off = np.concatenate([[0], np.cumsum(qlens)])
     clens = clens[:n_docs]
-    doc_tokens = int(clens.sum())
+    total = int(clens.sum())
     corpus = corpus[: doc_off[n_docs]]
     doc_off = doc_off[: n_docs + 1]
-
-    # mixedbread wants a list of [len, dim] f32 arrays (variable length).
-    docs_list = [
-        np.ascontiguousarray(corpus[doc_off[i] : doc_off[i + 1]]) for i in range(n_docs)
-    ]
-
-    # Our binary payload: packed sign bits, one [len, dim/8] block per doc,
-    # concatenated, plus the per-doc lengths the bridge folds over.
-    payload = npl.binarize(corpus)
     lens_i64 = clens.astype(np.int64)
+    tq = min(n_qry, args.time_queries)
 
-    # Our residual indexes (share one k-means so stage 1 is identical; only the
-    # payload codec differs). cdot per query is q @ centroids.T.
-    print(f"building residual codebooks over {doc_tokens} tokens ...", flush=True)
+    docs_orig = [np.ascontiguousarray(corpus[doc_off[i] : doc_off[i + 1]]) for i in range(n_docs)]
+
+    print(f"building shared codebook over {total} tokens ...", flush=True)
     idx4 = npl.build(corpus, clens, scheme="residual", nbits=4, seed=0, verbose=False)
-    idx2 = npl.build(
-        corpus, clens, scheme="residual", nbits=2, centroids=idx4.centroids,
-        seed=0, verbose=False,
-    )
-    lut4, lut2 = npl.quantize_lut(idx4.codec), npl.quantize_lut(idx2.codec)
-    cents = idx4.centroids  # [K, dim]
-
-    def score_query(qi, engine):
-        qf = np.ascontiguousarray(queries[q_off[qi] : q_off[qi + 1]])
-        if engine == "mixedbread":
-            return maxsim_cpu.maxsim_scores_variable(qf, docs_list)
-        if engine == "binary":
-            return nk.maxsim_docs(qf, payload, lens_i64)
-        # residual r4 / r2
-        idx, lut, nbits = (idx4, lut4, 4) if engine == "r4" else (idx2, lut2, 2)
-        cdot_t = np.ascontiguousarray((qf @ cents.T).T)  # [K, nq]
-        return nk.maxsim_docs_lut(
-            qf, idx.payload, idx.codes.astype(np.uint32), cdot_t,
-            lens_i64, lut.values, float(lut.scale), nbits,
-        )
-
-    engines = ["mixedbread", "binary", "r4", "r2"]
-    bpt = {  # resident bytes/token (payload only; centroid id is shared overhead)
-        "mixedbread": dim * 4, "binary": dim // 8, "r4": dim * 4 // 8, "r2": dim * 2 // 8,
+    cents = idx4.centroids
+    idxs = {
+        4: idx4,
+        2: npl.build(corpus, clens, scheme="residual", nbits=2, centroids=cents, seed=0, verbose=False),
+        1: npl.build(corpus, clens, scheme="residual", nbits=1, centroids=cents, seed=0, verbose=False),
     }
 
-    # Quality: NDCG@10 vs qrels, exhaustive ranking per query.
-    ndcg = {e: [] for e in engines}
-    for qi in range(n_qry):
-        rel = qrels.get(query_ids[qi], {})
-        if not rel:
-            continue
-        for e in engines:
-            scores = np.asarray(score_query(qi, e))
-            order = np.argsort(-scores)[:10]
-            ranked = [corpus_ids[j] for j in order]
-            ndcg[e].append(ndcg_at_k(ranked, rel, 10))
+    # Exact f32 ceiling: mixedbread on the ORIGINAL (uncompressed) embeddings.
+    print("scoring f32 ceiling (mixedbread on original embeddings) ...", flush=True)
+    ceiling = mean_ndcg(
+        lambda qf: maxsim_cpu.maxsim_scores_variable(qf, docs_orig),
+        n_qry, q_off, queries, qrels, query_ids, corpus_ids,
+    )
 
-    # Speed: score all queries once, per engine, best-of reps -> µs/doc.
-    latency = {}
-    for e in engines:
-        def run():
-            s = 0.0
-            for qi in range(n_qry):
-                s += float(np.asarray(score_query(qi, e)).sum())
-            return s
-        t, _ = best_of(run, args.reps)
-        latency[e] = t * 1e6 / (n_qry * n_docs)  # µs per (query, doc)
+    rows = []
+    for nbits in (4, 2, 1):
+        idx = idxs[nbits]
+        lut = npl.quantize_lut(idx.codec)
+        stored = dim * nbits // 8
+        print(f"nbits={nbits}: decoding {total} tokens to f32 ...", flush=True)
+        recon = npl.decode_rows(idx, np.arange(total)).astype(np.float32)
+        recon_list = [np.ascontiguousarray(recon[doc_off[i] : doc_off[i + 1]]) for i in range(n_docs)]
 
-    ceiling = float(np.mean(ndcg["mixedbread"])) if ndcg["mixedbread"] else 0.0
+        def ours(qf, idx=idx, lut=lut, nbits=nbits):
+            cdot_t = np.ascontiguousarray((qf @ cents.T).T)
+            return nk.maxsim_docs_lut(
+                qf, idx.payload, idx.codes.astype(np.uint32), cdot_t,
+                lens_i64, lut.values, float(lut.scale), nbits,
+            )
+
+        methods = [
+            ("baseline GEMM (per-doc)", stored, 512, lambda qf: naive_gemm(qf, recon_list), False),
+            ("mixedbread GEMM (var API)", stored, 512, lambda qf: maxsim_cpu.maxsim_scores_variable(qf, recon_list), False),
+            ("ours: fused on codes", stored, stored, ours, True),
+        ]
+        # NDCG: baseline==mixedbread (same reconstruction), so compute the GEMM
+        # NDCG once (via mixedbread) and reuse it for the baseline row; ours
+        # differs (int8), compute separately.
+        ndcg_gemm = mean_ndcg(methods[1][3], n_qry, q_off, queries, qrels, query_ids, corpus_ids)
+        ndcg_ours = mean_ndcg(methods[2][3], n_qry, q_off, queries, qrels, query_ids, corpus_ids)
+        ndcgs = [ndcg_gemm, ndcg_gemm, ndcg_ours]
+
+        for (name, sb, scoreb, fn, _mine), ndcg in zip(methods, ndcgs):
+            def run(fn=fn):
+                for qi in range(tq):
+                    qf = np.ascontiguousarray(queries[q_off[qi] : q_off[qi + 1]])
+                    np.asarray(fn(qf)).sum()
+            t = best_of(run, args.reps)
+            rows.append((nbits, name, sb, scoreb, t * 1e6 / (tq * n_docs), ndcg))
+        del recon, recon_list
+
+    # ── report ──────────────────────────────────────────────────────────────
     print(
-        f"\nSciFact exhaustive MaxSim: {n_qry} queries x {n_docs} docs "
-        f"({doc_tokens} doc tokens), dim={dim}\n"
-        f"both engines native arm64 + Accelerate; per-doc = per (query, doc)\n"
+        f"\nSciFact residual routes, exhaustive MaxSim: NDCG over {n_qry} queries, "
+        f"timing over {tq} x {n_docs} docs ({total} tokens), dim={dim}\n"
+        f"native arm64 + Accelerate, single-thread. score-B/tok = bytes touched "
+        f"to SCORE a token (GEMM must expand codes to f32).\n"
+        f"f32 ceiling (mixedbread on uncompressed): NDCG@10 = {ceiling:.4f}\n"
     )
-    print(f"  {'engine':<26}{'B/tok':>7}{'vs f32':>8}{'us/doc':>9}{'vs GEMM':>9}{'NDCG@10':>9}{'retention':>11}")
-    tg = latency["mixedbread"]
-    names = {
-        "mixedbread": "mixedbread f32 GEMM",
-        "binary": "ours: binary 1-bit fused",
-        "r4": "ours: residual-4 fused",
-        "r2": "ours: residual-2 fused",
-    }
-    for e in engines:
-        m = float(np.mean(ndcg[e])) if ndcg[e] else 0.0
+    hdr = f"  {'route':<7}{'method':<26}{'store':>7}{'score':>7}{'us/doc':>9}{'vs base':>9}{'NDCG@10':>9}{'retain':>8}"
+    print(hdr)
+    per_route_base = {}
+    for nbits, name, sb, scoreb, us, ndcg in rows:
+        if "baseline" in name:
+            per_route_base[nbits] = us
+        base = per_route_base[nbits]
         print(
-            f"  {names[e]:<26}{bpt[e]:>7}{dim * 4 // bpt[e]:>7}x"
-            f"{latency[e]:>9.3f}{tg / latency[e]:>8.2f}x{m:>9.4f}"
-            f"{(m / ceiling if ceiling else 0):>10.1%}"
+            f"  r{nbits:<6}{name:<26}{sb:>6}B{scoreb:>6}B{us:>9.3f}"
+            f"{base / us:>8.2f}x{ndcg:>9.4f}{(ndcg / ceiling if ceiling else 0):>7.1%}"
         )
-    print("\n(mixedbread = exact f32 ceiling; ours trades compression error for memory.)")
+        if "ours" in name:
+            print()
 
 
 if __name__ == "__main__":
