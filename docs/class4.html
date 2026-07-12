@@ -596,6 +596,42 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   class 03: find the identity, quantize the operands, fuse the loop, measure on every
   platform. next-plaid's residual rescore is still <code>decompress → GEMM</code>; this kernel
   is the port candidate.</p>
+
+  <div class="callout">
+    <p><b>The receipt, against a real GEMM engine.</b> Chapter 01 promised to remove that red
+    number without touching NDCG. Here it is, measured against the two GEMMs you'd actually
+    reach for: next-plaid's own <code>maxsim_score</code> (per-doc BLAS <code>sgemm</code> +
+    SIMD max — the honest baseline) and <a href="https://github.com/mixedbread-ai/maxsim-cpu">mixedbread-ai/maxsim-cpu</a>,
+    a production-tuned GEMM (batched <code>sgemm</code> + hand-vectorized fold). Full SciFact,
+    single-thread, and the decode-to-float is handed to the GEMM rows <em>for free</em>:</p>
+    <div class="tbl-wrap">
+      <table>
+        <tr><th>residual route</th><th>next-plaid GEMM</th><th>mixedbread GEMM</th><th>ours · fused on codes</th><th>score-time bytes</th></tr>
+        <tr><td class="mono">r4</td><td class="mono">6.80 µs</td><td class="mono">14.66</td><td class="mono" style="color:var(--ok)"><b>3.93 (1.73×)</b></td><td class="mono">64 vs 512 B</td></tr>
+        <tr><td class="mono">r2</td><td class="mono">6.87</td><td class="mono">15.12</td><td class="mono" style="color:var(--ok)"><b>3.93 (1.75×)</b></td><td class="mono">32 vs 512 B</td></tr>
+        <tr><td class="mono">r1</td><td class="mono">6.90</td><td class="mono">15.26</td><td class="mono" style="color:var(--ok)"><b>4.20 (1.64×)</b></td><td class="mono">16 vs 512 B</td></tr>
+      </table>
+    </div>
+    <p>NDCG tracks the f32 ceiling to a rounding error (r4 <b>0.7569</b> vs 0.7599 exact), because
+    our int8 ranking of the codes reproduces the reconstruction's order. The surprise is that
+    mixedbread's <em>optimized</em> GEMM is the slowest column — and the reason is the whole
+    point of the class:</p>
+    <div class="tbl-wrap">
+      <table>
+        <tr><th>per doc token</th><th>µs</th><th></th></tr>
+        <tr><td class="mono">Accelerate <code>sgemm</code> alone</td><td class="mono">5.1</td><td>the floor <em>every</em> f32 path shares</td></tr>
+        <tr><td class="mono">+ the max-fold</td><td class="mono">6.4</td><td>fold is ~1/dim ≈ 0.8% of the GEMM's FLOPs</td></tr>
+        <tr><td class="mono">ours · fused on codes</td><td class="mono" style="color:var(--ok)"><b>3.9</b></td><td><b>below the floor</b></td></tr>
+      </table>
+    </div>
+    <p>Optimizing the fold — all a "better GEMM" can do — only creeps toward the 5.1 floor;
+    mixedbread's genuine best case (uniform API, all 10 cores) lands at 6.0, right on it, and
+    its variable-length API overhead is what pushes the single-thread number to 15. You cannot
+    beat BLAS by out-BLAS-ing BLAS. Our kernel is <em>under</em> the floor for the one reason a
+    GEMM never can be: it never runs the f32 GEMM — it scores an int8 view of the codes and
+    never materializes the 512-byte reconstruction the GEMM is optimizing around. Reproduce with
+    <code>bench/compare_gemm.py</code>.</p>
+  </div>
 </section>
 
 <!-- ═══ 11 QUIZ ═══ -->
