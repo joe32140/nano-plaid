@@ -34,6 +34,11 @@ jobs:
       # µs/doc as noisy; it shows which fused kernel this arch dispatches to.
       - name: bench (indicative)
         run: cargo run --release --example bench
+      # The whole ladder on one dataset (binary + residual-4/2/1, every
+      # ablation) against a shared baseline, with a per-rung bit-identity check.
+      # Same "shared VM = noisy absolutes" caveat; the shape is the point.
+      - name: ladder (indicative)
+        run: cargo run --release --example ladder
 
   # The numpy engine: self-test plus the committed toy bundle end-to-end.
   python:
@@ -93,3 +98,8 @@ jobs:
         run: |
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$SDE_PATH/sde64 -icx --"
           cargo test --release
+          # Populate the AVX-512 rows of the ladder and confirm they are
+          # bit-identical under emulation. `quick` keeps the emulated run short;
+          # the µs/doc here are meaningless (SDE is not cycle-accurate) — real
+          # AVX-512 speed comes from a natural Intel draw of the `rust` job.
+          cargo run --release --example ladder -- quick

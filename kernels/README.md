@@ -18,6 +18,13 @@ faster, all returning **bit-identical** scores:
 (32-token query × 2000 docs × 80 tokens, dim=128, Apple M4,
 `cargo run --release --example bench`.)
 
+**To see the whole ladder in one run** — binary and residual-4/2/1, every
+ablation lined up against one shared f32 baseline with a per-rung bit-identity
+check — use `cargo run --release --example ladder` (`-- quick` for a fast
+smoke test). It prints only the rungs this CPU can run and marks the rest
+`n/a`, so the same command shows the NEON ladder on Apple/Graviton and the
+AVX2/AVX-512 ladder on x86.
+
 **On x86_64** rung 4 is `maxsim_avx2_sad128` (AVX2 masked-SAD) instead of NEON
 SDOT — same fused doc-token-outer idea, same bit-identical scores, AVX2-only so
 it runs on essentially any Linux/x86 machine. **Rung 6** (`maxsim_avx512_vnni_128`)
