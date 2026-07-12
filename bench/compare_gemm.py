@@ -140,6 +140,35 @@ def main():
     )
 
     rows = []
+
+    # Binary route: packed sign bits scored by the fused binary kernel; the
+    # baseline decodes them to ±1 f32 (next-plaid maxsim_binary) then per-doc
+    # GEMM — the same next-plaid baseline as the residual routes, ±1 operand.
+    print("binary: binarizing + decoding to +/-1 f32 ...", flush=True)
+    packed = npl.binarize(corpus)
+    signs = np.unpackbits(packed, axis=1, count=dim).astype(np.float32) * 2.0 - 1.0
+    signs_list = [np.ascontiguousarray(signs[doc_off[i] : doc_off[i + 1]]) for i in range(n_docs)]
+
+    def ours_bin(qf):
+        return nk.maxsim_docs(qf, packed, lens_i64)
+
+    bmethods = [("baseline GEMM (next-plaid)", dim // 8, 512, lambda qf: gemm_maxsim(qf, signs_list), False)]
+    if HAVE_MBX:
+        bmethods.append(
+            ("mixedbread GEMM (var API)", dim // 8, 512, lambda qf: maxsim_cpu.maxsim_scores_variable(qf, signs_list), False)
+        )
+    bmethods.append(("ours: fused on codes", dim // 8, dim // 8, ours_bin, True))
+    ndcg_bg = mean_ndcg(bmethods[0][3], n_qry, q_off, queries, qrels, query_ids, corpus_ids)
+    ndcg_bo = mean_ndcg(ours_bin, n_qry, q_off, queries, qrels, query_ids, corpus_ids)
+    for name, sb, scoreb, fn, mine in bmethods:
+        def runb(fn=fn):
+            for qi in range(tq):
+                qf = np.ascontiguousarray(queries[q_off[qi] : q_off[qi + 1]])
+                np.asarray(fn(qf)).sum()
+        t = best_of(runb, args.reps)
+        rows.append(("bin", name, sb, scoreb, t * 1e6 / (tq * n_docs), ndcg_bo if mine else ndcg_bg))
+    del signs, signs_list
+
     for nbits in (4, 2, 1):
         idx = idxs[nbits]
         lut = npl.quantize_lut(idx.codec)
@@ -173,13 +202,13 @@ def main():
                     qf = np.ascontiguousarray(queries[q_off[qi] : q_off[qi + 1]])
                     np.asarray(fn(qf)).sum()
             t = best_of(run, args.reps)
-            rows.append((nbits, name, sb, scoreb, t * 1e6 / (tq * n_docs), ndcg_ours if mine else ndcg_gemm))
+            rows.append((f"r{nbits}", name, sb, scoreb, t * 1e6 / (tq * n_docs), ndcg_ours if mine else ndcg_gemm))
         del recon, recon_list
 
     # ── report ──────────────────────────────────────────────────────────────
     mbx = "on (optional)" if HAVE_MBX else "off (pip install maxsim-cpu to add)"
     print(
-        f"\nSciFact residual routes, exhaustive MaxSim: NDCG over {n_qry} queries, "
+        f"\nSciFact binary + residual routes, exhaustive MaxSim: NDCG over {n_qry} queries, "
         f"timing over {tq} x {n_docs} docs ({total} tokens), dim={dim}\n"
         f"native arm64 + Accelerate, single-thread. baseline = next-plaid maxsim_score. "
         f"mixedbread column: {mbx}\n"
@@ -188,12 +217,12 @@ def main():
     )
     print(f"  {'route':<7}{'method':<27}{'store':>6}{'score':>7}{'us/doc':>9}{'vs base':>9}{'NDCG@10':>9}{'retain':>8}")
     base = {}
-    for nbits, name, sb, scoreb, us, ndcg in rows:
+    for route, name, sb, scoreb, us, ndcg in rows:
         if "baseline" in name:
-            base[nbits] = us
+            base[route] = us
         print(
-            f"  r{nbits:<6}{name:<27}{sb:>5}B{scoreb:>6}B{us:>9.3f}"
-            f"{base[nbits] / us:>8.2f}x{ndcg:>9.4f}{(ndcg / ceiling if ceiling else 0):>7.1%}"
+            f"  {route:<7}{name:<27}{sb:>5}B{scoreb:>6}B{us:>9.3f}"
+            f"{base[route] / us:>8.2f}x{ndcg:>9.4f}{(ndcg / ceiling if ceiling else 0):>7.1%}"
         )
         if "ours" in name:
             print()

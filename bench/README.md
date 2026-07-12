@@ -28,21 +28,29 @@ f32 ceiling (exact MaxSim on the *uncompressed* embeddings): **NDCG@10 = 0.7629*
 
 | route | method | store | score | µs/doc | vs base | NDCG@10 | retention |
 |---|---|--:|--:|--:|--:|--:|--:|
-| **r4** | baseline GEMM (next-plaid) | 64 B | 512 B | 6.80 | 1.00× | 0.7599 | 99.6% |
-| | mixedbread GEMM *(opt.)* | 64 B | 512 B | 14.66 | 0.46× | 0.7599 | 99.6% |
-| | **ours: fused on codes** | 64 B | **64 B** | **3.93** | **1.73×** | 0.7569 | 99.2% |
-| **r2** | baseline GEMM (next-plaid) | 32 B | 512 B | 6.87 | 1.00× | 0.7356 | 96.4% |
-| | mixedbread GEMM *(opt.)* | 32 B | 512 B | 15.12 | 0.45× | 0.7356 | 96.4% |
-| | **ours: fused on codes** | 32 B | **32 B** | **3.93** | **1.75×** | 0.7372 | 96.6% |
-| **r1** | baseline GEMM (next-plaid) | 16 B | 512 B | 6.90 | 1.00× | 0.6138 | 80.5% |
-| | mixedbread GEMM *(opt.)* | 16 B | 512 B | 15.26 | 0.45× | 0.6138 | 80.5% |
-| | **ours: fused on codes** | 16 B | **16 B** | **4.20** | **1.64×** | 0.6137 | 80.4% |
+| **binary** | baseline GEMM (next-plaid) | 16 B | 512 B | 6.87 | 1.00× | 0.7512 | 98.5% |
+| | mixedbread GEMM *(opt.)* | 16 B | 512 B | 14.40 | 0.48× | 0.7512 | 98.5% |
+| | **ours: fused on codes** | 16 B | **16 B** | **3.48** | **1.98×** | 0.7513 | 98.5% |
+| **r4** | baseline GEMM (next-plaid) | 64 B | 512 B | 6.71 | 1.00× | 0.7599 | 99.6% |
+| | mixedbread GEMM *(opt.)* | 64 B | 512 B | 15.94 | 0.42× | 0.7599 | 99.6% |
+| | **ours: fused on codes** | 64 B | **64 B** | **3.85** | **1.74×** | 0.7569 | 99.2% |
+| **r2** | baseline GEMM (next-plaid) | 32 B | 512 B | 6.75 | 1.00× | 0.7356 | 96.4% |
+| | mixedbread GEMM *(opt.)* | 32 B | 512 B | 16.00 | 0.42× | 0.7356 | 96.4% |
+| | **ours: fused on codes** | 32 B | **32 B** | **3.86** | **1.75×** | 0.7372 | 96.6% |
+| **r1** | baseline GEMM (next-plaid) | 16 B | 512 B | 6.79 | 1.00× | 0.6138 | 80.5% |
+| | mixedbread GEMM *(opt.)* | 16 B | 512 B | 15.90 | 0.43× | 0.6138 | 80.5% |
+| | **ours: fused on codes** | 16 B | **16 B** | **4.15** | **1.64×** | 0.6137 | 80.4% |
 
-**Our fused kernel beats the next-plaid GEMM baseline 1.6–1.75× per route**, at
+**Our fused kernel beats the next-plaid GEMM baseline 1.6–2.0× per route**, at
 8–32× less scoring memory, needing no decode, at ~identical NDCG (our int8
 ranking tracks the f32 reconstruction to a rounding error — 0.7569 vs 0.7599 at
-r4). r1's 80% retention is the 1-bit residual *codec*, not the kernel; r4 keeps
-99%.
+r4). **Binary is the standout** — it decodes to a `±1` operand, so its baseline
+is the same next-plaid GEMM, but its fused kernel is the fastest (no centroid
+term → the max stays integer, skipping the per-row float fold), landing the
+biggest win at **1.98×** and 32× less memory. Note binary keeps 98.5% NDCG at
+the *same* 16 B/token where residual-1 keeps only 80% — the sign codec beats the
+1-bit residual codec, so binary, not r1, is the right 16-byte route. r1's 80% is
+the 1-bit residual *codec*, not the kernel; r4 keeps 99%.
 
 ## Why the GEMM baseline can't be beaten by a better GEMM
 
