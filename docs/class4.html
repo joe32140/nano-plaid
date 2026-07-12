@@ -606,16 +606,20 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
     single-thread, and the decode-to-float is handed to the GEMM rows <em>for free</em>:</p>
     <div class="tbl-wrap">
       <table>
-        <tr><th>residual route</th><th>next-plaid GEMM</th><th>mixedbread GEMM</th><th>ours · fused on codes</th><th>score-time bytes</th></tr>
-        <tr><td class="mono">r4</td><td class="mono">6.80 µs</td><td class="mono">14.66</td><td class="mono" style="color:var(--ok)"><b>3.93 (1.73×)</b></td><td class="mono">64 vs 512 B</td></tr>
-        <tr><td class="mono">r2</td><td class="mono">6.87</td><td class="mono">15.12</td><td class="mono" style="color:var(--ok)"><b>3.93 (1.75×)</b></td><td class="mono">32 vs 512 B</td></tr>
-        <tr><td class="mono">r1</td><td class="mono">6.90</td><td class="mono">15.26</td><td class="mono" style="color:var(--ok)"><b>4.20 (1.64×)</b></td><td class="mono">16 vs 512 B</td></tr>
+        <tr><th>route</th><th>next-plaid GEMM</th><th>mixedbread GEMM</th><th>ours · fused on codes</th><th>score-time bytes</th></tr>
+        <tr><td class="mono">binary</td><td class="mono">6.87 µs</td><td class="mono">14.40</td><td class="mono" style="color:var(--ok)"><b>3.48 (1.98×)</b></td><td class="mono">16 vs 512 B</td></tr>
+        <tr><td class="mono">r4</td><td class="mono">6.71</td><td class="mono">15.94</td><td class="mono" style="color:var(--ok)"><b>3.85 (1.74×)</b></td><td class="mono">64 vs 512 B</td></tr>
+        <tr><td class="mono">r2</td><td class="mono">6.75</td><td class="mono">16.00</td><td class="mono" style="color:var(--ok)"><b>3.86 (1.75×)</b></td><td class="mono">32 vs 512 B</td></tr>
+        <tr><td class="mono">r1</td><td class="mono">6.79</td><td class="mono">15.90</td><td class="mono" style="color:var(--ok)"><b>4.15 (1.64×)</b></td><td class="mono">16 vs 512 B</td></tr>
       </table>
     </div>
     <p>NDCG tracks the f32 ceiling to a rounding error (r4 <b>0.7569</b> vs 0.7599 exact), because
-    our int8 ranking of the codes reproduces the reconstruction's order. The surprise is that
-    mixedbread's <em>optimized</em> GEMM is the slowest column — and the reason is the whole
-    point of the class:</p>
+    our int8 ranking of the codes reproduces the reconstruction's order. <b>Binary is the
+    standout</b> — the biggest win at 1.98×, because with no centroid term its max stays integer
+    (chapter 07) and it skips the per-row float fold; it also holds 98.5% NDCG at the <em>same</em>
+    16 bytes where residual-1 keeps only 80%, so binary — not r1 — is the right 16-byte route. The
+    other surprise is that mixedbread's <em>optimized</em> GEMM is the slowest column — and the
+    reason is the whole point of the class:</p>
     <div class="tbl-wrap">
       <table>
         <tr><th>per doc token</th><th>µs</th><th></th></tr>
@@ -944,5 +948,6 @@ const CDOT=0.4183;
 })();
 })();
 </script>
+<script src="glossary.js" defer></script>
 </body>
 </html>
