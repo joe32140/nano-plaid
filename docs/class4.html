@@ -594,8 +594,8 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   85 MB), and its quality column (0.7340, <em>below</em> binary at 1.8× the bytes) makes you
   ask whether that earns it a slot. <strong>Third</strong>, the pattern is the same one that produced
   class 03: find the identity, quantize the operands, fuse the loop, measure on every
-  platform. next-plaid's residual rescore is still <code>decompress → GEMM</code>; this kernel
-  is the port candidate.</p>
+  platform. And the pattern survived contact with a production engine — the epilogue below
+  is that story, and it ends by renaming this class.</p>
 
   <div class="callout">
     <p><b>The receipt, against a real GEMM engine.</b> Chapter 01 promised to remove that red
@@ -636,6 +636,68 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
     never materializes the 512-byte reconstruction the GEMM is optimizing around. Reproduce with
     <code>bench/compare_gemm.py</code>.</p>
   </div>
+
+  <div class="callout">
+    <p><b>Epilogue — the port shipped, and the LUT turned out to be a decoder.</b>
+    next-plaid's asymmetric residual path now scores packed codes directly inside its
+    two-stage engine: the same <code>tbl</code> + <code>sdot</code> on NEON,
+    <code>pshufb</code> + <code>psignb</code> + <code>pmaddubsw</code> on AVX2,
+    bit-identity-tested against the scalar spec on all three CI targets. Quality on the full
+    grid — 3 models × 3 datasets × r4/r2/r1 — moved by <b>|ΔNDCG@10| ≤ 0.0021</b> against
+    decompress → GEMM. The uncomfortable table generalized: it was never a SciFact fact,
+    it's a scheme fact.</p>
+    <p style="margin-top:10px"><b>The porting lesson.</b> The production codec packs codes
+    for any nbits and dim, with its own LSB-first bit-reversal — so the port's first decoder
+    was the honest general one: a <b>256-entry byte → weights table</b>. Correct, general,
+    and unSIMDable — <code>tbl</code>/<code>pshufb</code> address 16 entries, not 256 — so
+    the "fast" port was a scalar walk in disguise, and at mixedbread's 786-token doc shape it
+    measured <b>0.46×</b>: slower than the GEMM it replaced. The fix was not a new idea; it
+    was chapter 06 recovered <em>with a proof</em>: factor the byte table into
+    per-key-position 16-entry nibble tables (codes never straddle a nibble), <b>verify the
+    factorization over all 256 byte values when the table is built</b>, and fall back to
+    scalar if it ever fails. Eight little tables instead of one — each key position reads its
+    own permutation of the same 16 weights, because that's what the bit-reversal does.
+    Generalize for the engine; re-specialize for the register; make the equivalence a checked
+    invariant, not a hope.</p>
+    <p style="margin-top:10px"><b>What the port forced us to admit.</b> Inside a real engine
+    the obvious question finally got asked: if the win is skipping decompression, do we need
+    a lookup table at all — couldn't this just be two matrix products, centroid and residual,
+    each against the query? Answer: <b>it is two matrix products.</b> That is what the kernel
+    has been since chapter 03:</p>
+    <div class="split-line">
+      q · token &nbsp;=&nbsp; <span class="cterm">gather from stage 1's [nq, K] matrix</span>
+      &nbsp;+&nbsp; <span class="rterm">int8 GEMM · q8 × decoded weights</span>
+    </div>
+    <p>The table holds <em>weights</em>, not scores — it never sees the query. It is the
+    decoder the packed storage format forces, and the hardware makes decoding ~free: inside
+    next-plaid, rescore time is flat across r4/r2/r1 (<b>16.5 / 16.3 / 16.7 ms</b>, x86 CI,
+    1024-doc shortlists) — chapter 09's flat line, reproduced in production. Two corners of
+    the design space fall out for free. Store residuals as raw int8 (128 B/token) and no
+    table exists at all — the table's entire job is buying r4's 64 B at zero decode cost.
+    Expand codes to <em>float</em> and hand the residual to a real GEMM, and you have
+    reinvented decompression — the very term the split exists to delete. So the honest name
+    for this class's kernel is <b>fused int8 residual scoring</b>; "LUT kernel" keeps making
+    smart people ask where the lookup went.</p>
+    <p style="margin-top:10px"><b>And where the port moved the story.</b> Whole-pipeline
+    profiling — production stage 1 + rescore, 1024-doc shortlists — says the next chapter is
+    not in this loop:</p>
+    <div class="tbl-wrap">
+      <table>
+        <tr><th>inside next-plaid <span class="pill">CI</span></th><th>x86 AVX2</th><th>Neoverse N2</th></tr>
+        <tr><td class="mono">decompress share of float rescore</td><td class="mono">70%</td><td class="mono">62%</td></tr>
+        <tr><td class="mono">fused vs float, kernel-level (r4 / binary)</td><td class="mono">3.1× / 9.0×</td><td class="mono">1.5× / 9.5×</td></tr>
+        <tr><td class="mono">binary vs float, <b>end-to-end</b></td><td class="mono" style="color:var(--ok)"><b>4.3×</b></td><td class="mono" style="color:var(--ok)"><b>2.8×</b></td></tr>
+        <tr><td class="mono">stage 1 vs binary rescore</td><td class="mono">8.5 vs 5.6 ms</td><td class="mono">11.0 vs 2.8 ms</td></tr>
+      </table>
+    </div>
+    <p class="note">Synthetic 2,000-doc corpus, 180 tokens/doc, dim 128, shared CI VMs —
+    ratios, not absolutes.</p>
+    <p>Kernel wins dilute end-to-end because stage 1 — query × centroids, IVF probing — does
+    not shrink when stage 2 does. At a mere 2,000 documents the binary rescore is already
+    <em>cheaper than the stage that feeds it</em>, and stage 1 grows with the corpus while
+    the shortlist stays ~1,024 docs. Beat decompression, and the bottleneck walks upstream.
+    That is the next kernel's problem — and it will not be a lookup table.</p>
+  </div>
 </section>
 
 <!-- ═══ 11 QUIZ ═══ -->
@@ -657,7 +719,10 @@ acc = <span class="fn">pmaddwd</span>(p, 1) + acc     <span class="cm">// widen 
   the kernels are <span class="mono">maxsim_r4_*</span> in
   <span class="mono">kernels/src/lib.rs</span>, bit-identity-tested against the spec on x86
   AVX2, Apple NEON, and Neoverse NEON in CI. All latency figures measured
-  (<span class="mono">eval.py --profile</span>, full SciFact, Apple M4).</p>
+  (<span class="mono">eval.py --profile</span>, full SciFact, Apple M4). The production port
+  is <span class="mono">residual_lut.rs</span> in next-plaid (branch
+  <span class="mono">feat/asymmetric-lut-residual</span>), with its own bit-identity suite
+  and a whole-pipeline phase profiler in CI.</p>
 </footer>
 </main>
 
