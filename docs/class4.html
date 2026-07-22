@@ -260,10 +260,13 @@
 <section id="r4">
   <span class="eyebrow">04 · the structural gift</span>
   <h2>One table to rule every dim</h2>
-  <p class="lede">Here is the fact the whole kernel stands on, and it's a property of how the
-  codec is <em>trained</em>: nano-plaid buckets the residual distribution <strong>globally</strong>
-  — so there is ONE 16-entry weight table, shared by every dimension of every token of every
-  document. Hover any code below:</p>
+  <p class="lede">Here is the fact the whole kernel stands on, and it is a property of how
+  the codec is <em>trained</em>. Training the quantizer is nothing more than choosing 16
+  numbers: pool every residual value in the corpus — every dimension of every token of every
+  document, one giant pile of plain scalars — sort the pile, cut it into 16 equal-count
+  bins, and keep one representative value per bin. Those 16 numbers are the whole decoder; a
+  4-bit code just says <em>which bin</em>. ONE table, shared by every dimension of every
+  token of every document. Hover any code below:</p>
 
   <div class="widget">
     <div class="widget-head"><span class="widget-title">4 doc tokens × 8 dims of codes — all pointing into the same 16 weights</span></div>
@@ -276,6 +279,19 @@
     for a table so small the lookup can happen <em>inside the CPU core, in one instruction</em>
     (chapter 06). No memory traffic, no decode buffer, no per-dim anything.</p>
   </div>
+
+  <p>Two things about those sixteen numbers are doing quiet work. <strong>Read their
+  spacing</strong>: neighbors near zero sit 10–11 apart (−5, 5, ±16, ±26), the middle pairs
+  16–21 apart, and the outermost jump is 37 (−127 to −90). That shape is equal-count binning
+  meeting a peaked histogram: residuals are corrections, so small values are common and large
+  ones rare — narrow bins land where the data is dense, and most codes get the finest
+  resolution. <strong>And why is one table enough for 128 different dimensions?</strong>
+  Because the centroid already absorbed what made dimensions differ. After
+  <code>token − centroid[cid]</code>, every dimension is left holding the same kind of thing:
+  a small, near-zero-mean correction at a similar scale. Statistically interchangeable
+  leftovers can share one quantile grid — that sharing is exactly the "little accuracy" the
+  note above trades (per-dim tables would hug each dimension's histogram slightly tighter),
+  and it buys the 16-byte decoder the rest of the class is built on.</p>
 </section>
 
 <!-- ═══ 05 GENERALIZE ═══ -->
