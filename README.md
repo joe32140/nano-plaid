@@ -165,7 +165,21 @@ Two more honest readings. **The 16× is partly a numpy tax:** residual-4's
 111 ms baseline is ~96% decode machinery (unpack bits, index the table,
 materialize floats) and only ~4 ms of actual GEMM; a compiled decode → GEMM
 (what next-plaid does today) would sit near 15–25 ms, so the win a production
-port should expect is 2–3×, like binary's. **The history:** the first release
+port should expect is 2–3×, like binary's. That prediction has since been
+paid: the next-plaid port (branch `feat/asymmetric-lut-residual`) measures
+the fused path at **2.2–6.3×** against its own compiled decompress → GEMM on
+real corpus shapes across x86 AVX2 / Neoverse / Apple M1 — and its phase
+profiler shows decompression is 65–84% of that float path, which is the
+entire win (you don't out-multiply BLAS; you stop feeding it). Quality on
+9 real model×dataset cells: |ΔNDCG@10| ≤ 0.0021, 95% paired-bootstrap CIs
+essentially inside ±0.005, and the three cells where a CI excludes zero all
+favor the int8 path. One subtlety this toy engine doesn't have: next-plaid's
+decompress **renormalizes** each reconstructed token, so the asymmetric port
+must score against cached per-token `1/‖·‖` norms — skip that and nbits=1
+loses up to 0.17 NDCG@10 on long-query corpora. Speedups are also
+baseline-relative in a way any port should disclose: the same binary kernel
+that is 13–22× against decompress+GEMM is ~3–4× against raw-float + vendor
+BLAS and ~1× against Apple's AMX on raw floats — name the baseline, always. **The history:** the first release
 said `--backend rust` was binary-only, "because residual rescore is a
 `decode → BLAS matmul` and BLAS is already the fast path a hand kernel can't
 beat." True — and beside the point. You don't out-multiply BLAS; you stop
